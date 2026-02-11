@@ -15,7 +15,7 @@ import (
 	"time"
 	"unsafe"
 
-	"gitee.com/lovewonyoung/tp_driver/tplin"
+	"github.com/LoveWonYoung/linbuskit/tplin"
 	"golang.org/x/sys/windows/registry"
 )
 

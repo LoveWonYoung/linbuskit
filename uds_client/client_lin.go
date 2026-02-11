@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"gitee.com/lovewonyoung/tp_driver/tplin"
+	"github.com/LoveWonYoung/linbuskit/tplin"
 )
 
 // ClientConfig holds configuration options for the UDS client.

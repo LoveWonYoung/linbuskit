@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"gitee.com/lovewonyoung/tp_driver/tplin"
+	"github.com/LoveWonYoung/linbuskit/tplin"
 )
 
 // MockUDSDriver 是一个模拟 UDS 从节点的驱动
