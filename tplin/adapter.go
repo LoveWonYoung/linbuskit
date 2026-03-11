@@ -2,24 +2,6 @@ package tplin
 
 import "time"
 
-type Direction int
-type ChecksumType int
-type PCIType byte
-
-const (
-	ClassicChecksum  ChecksumType = iota // Up to LIN 1.3
-	EnhancedChecksum                     // LIN 2.0 and later
-)
-const (
-	RX Direction = iota // Received from the bus
-	TX                  // Transmitted to the bus
-)
-const (
-	SF PCIType = 0 // Single Frame
-	FF PCIType = 1 // First Frame
-	CF PCIType = 2 // Consecutive Frame
-)
-
 const (
 	// MasterDiagnosticFrameID Frame IDs
 	MasterDiagnosticFrameID = 0x3C
@@ -53,23 +35,6 @@ const (
 	DefaultReadTimeout       = 10 * time.Millisecond
 	DefaultMultiFrameTimeout = 1 * time.Second // 多帧接收超时
 )
-
-// LinEvent represents a raw, low-level LIN frame/event.
-type LinEvent struct {
-	EventID      byte
-	EventPayload []byte
-	ChecksumType ChecksumType
-	Direction    Direction
-	Timestamp    time.Time
-}
-
-// Driver is the interface that abstracts the underlying LIN hardware or simulation.
-type Driver interface {
-	ReadEvent(timeout time.Duration) (*LinEvent, error)
-	WriteMessage(event *LinEvent) error
-	ScheduleSlaveResponse(event *LinEvent) error
-	RequestSlaveResponse(frameID byte) error
-}
 
 // TransportConfig holds configuration options for the transport layer.
 type TransportConfig struct {

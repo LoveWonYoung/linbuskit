@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/LoveWonYoung/linbuskit/liniface"
 	"github.com/LoveWonYoung/linbuskit/tplin"
 )
 
@@ -32,12 +33,12 @@ type Client struct {
 }
 
 // NewClient 创建一个新的 UDS 客户端实例。
-func NewClient(driver tplin.Driver, targetNad byte) *Client {
+func NewClient(driver liniface.Driver, targetNad byte) *Client {
 	return NewClientWithConfig(driver, DefaultClientConfig(targetNad))
 }
 
 // NewClientWithConfig 使用自定义配置创建客户端。
-func NewClientWithConfig(driver tplin.Driver, config ClientConfig) *Client {
+func NewClientWithConfig(driver liniface.Driver, config ClientConfig) *Client {
 	master := tplin.NewMaster(driver)
 	return &Client{
 		master: master,

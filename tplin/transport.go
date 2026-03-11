@@ -6,6 +6,8 @@ import (
 	"log"
 	"sync"
 	"time"
+
+	"github.com/LoveWonYoung/linbuskit/liniface"
 )
 
 // DefaultTransportConfig returns a configuration with sensible defaults.
@@ -43,11 +45,11 @@ func putBuffer(buf *[]byte) {
 // Transport handles the logic of the LIN transport protocol (TP).
 type Transport struct {
 	isSlave          bool
-	driver           Driver
-	txQueue          chan *LinEvent
+	driver           liniface.Driver
+	txQueue          chan *liniface.LinEvent
 	rxQueue          chan *LinMessage
 	config           TransportConfig
-	scheduledTxEvent *LinEvent
+	scheduledTxEvent *liniface.LinEvent
 
 	// State for multi-frame reception (RWMutex for better concurrency)
 	stateMutex          sync.RWMutex
@@ -71,16 +73,16 @@ type LinMessage struct {
 }
 
 // NewTransport creates a new instance of the LIN transport layer with default config.
-func NewTransport(isSlave bool, driver Driver) *Transport {
+func NewTransport(isSlave bool, driver liniface.Driver) *Transport {
 	return NewTransportWithConfig(isSlave, driver, DefaultTransportConfig())
 }
 
 // NewTransportWithConfig creates a new instance of the LIN transport layer with custom config.
-func NewTransportWithConfig(isSlave bool, driver Driver, config TransportConfig) *Transport {
+func NewTransportWithConfig(isSlave bool, driver liniface.Driver, config TransportConfig) *Transport {
 	return &Transport{
 		isSlave: isSlave,
 		driver:  driver,
-		txQueue: make(chan *LinEvent, config.TxQueueSize),
+		txQueue: make(chan *liniface.LinEvent, config.TxQueueSize),
 		rxQueue: make(chan *LinMessage, config.RxQueueSize),
 		config:  config,
 	}
@@ -214,7 +216,7 @@ func (t *Transport) Transmit(nad, sid byte, data []byte) {
 	}
 	dataLen := len(data) + 1
 	if dataLen <= 6 {
-		pci := (byte(SF) << 4) | byte(dataLen)
+		pci := (byte(liniface.SF) << 4) | byte(dataLen)
 		bufPtr := getBuffer()
 		payload := *bufPtr
 		payload[0] = nad
@@ -224,10 +226,10 @@ func (t *Transport) Transmit(nad, sid byte, data []byte) {
 		eventPayload := make([]byte, 8)
 		copy(eventPayload, payload)
 		putBuffer(bufPtr)
-		t.txQueue <- &LinEvent{EventID: eventID, EventPayload: eventPayload, ChecksumType: ClassicChecksum}
+		t.txQueue <- &liniface.LinEvent{EventID: eventID, EventPayload: eventPayload, ChecksumType: liniface.ClassicChecksum}
 	} else {
 
-		pci := (byte(FF) << 4) | byte(dataLen>>8&0x0F)
+		pci := (byte(liniface.FF) << 4) | byte(dataLen>>8&0x0F)
 		bufPtrFF := getBuffer()
 		payloadFF := *bufPtrFF
 		payloadFF[0] = nad
@@ -238,13 +240,13 @@ func (t *Transport) Transmit(nad, sid byte, data []byte) {
 		eventPayloadFF := make([]byte, 8)
 		copy(eventPayloadFF, payloadFF)
 		putBuffer(bufPtrFF)
-		t.txQueue <- &LinEvent{EventID: eventID, EventPayload: eventPayloadFF, ChecksumType: ClassicChecksum}
+		t.txQueue <- &liniface.LinEvent{EventID: eventID, EventPayload: eventPayloadFF, ChecksumType: liniface.ClassicChecksum}
 
 		currentByte := 4
 		currentFrame := 0
 		for currentByte < len(data) {
 			currentFrame = (currentFrame + 1) % 16
-			pciCF := (byte(CF) << 4) | byte(currentFrame)
+			pciCF := (byte(liniface.CF) << 4) | byte(currentFrame)
 			bufPtrCF := getBuffer()
 			payloadCF := *bufPtrCF
 			payloadCF[0] = nad
@@ -259,16 +261,16 @@ func (t *Transport) Transmit(nad, sid byte, data []byte) {
 			eventPayloadCF := make([]byte, 8)
 			copy(eventPayloadCF, payloadCF)
 			putBuffer(bufPtrCF)
-			t.txQueue <- &LinEvent{EventID: eventID, EventPayload: eventPayloadCF, ChecksumType: ClassicChecksum}
+			t.txQueue <- &liniface.LinEvent{EventID: eventID, EventPayload: eventPayloadCF, ChecksumType: liniface.ClassicChecksum}
 		}
 	}
 }
 
 // receiveFromDriver processes a raw event from the driver and updates the TP state.
-func (t *Transport) receiveFromDriver(event *LinEvent) {
+func (t *Transport) receiveFromDriver(event *liniface.LinEvent) {
 	t.stateMutex.Lock()
 	defer t.stateMutex.Unlock()
-	if t.isSlave && event.Direction == TX && t.scheduledTxEvent != nil {
+	if t.isSlave && event.Direction == liniface.TX && t.scheduledTxEvent != nil {
 		if t.scheduledTxEvent.EventID == event.EventID {
 			t.scheduledTxEvent = nil
 			select {
@@ -287,7 +289,7 @@ func (t *Transport) receiveFromDriver(event *LinEvent) {
 	isMasterReceiving := !t.isSlave && event.EventID == SlaveDiagnosticFrameID
 	isSlaveReceiving := t.isSlave && event.EventID == MasterDiagnosticFrameID
 
-	if event.Direction == RX && (isMasterReceiving || isSlaveReceiving) {
+	if event.Direction == liniface.RX && (isMasterReceiving || isSlaveReceiving) {
 		payload := event.EventPayload
 		if !t.isSlave && len(payload) == 0 {
 			return // Master ignores empty frames (no-response from slave)
@@ -297,11 +299,11 @@ func (t *Transport) receiveFromDriver(event *LinEvent) {
 		}
 
 		nad, pci := payload[0], payload[1]
-		pciType := PCIType(pci >> 4)
+		pciType := liniface.PCIType(pci >> 4)
 		additionalInfo := pci & 0x0F
 
 		switch pciType {
-		case SF:
+		case liniface.SF:
 			if t.remainingBytes > 0 {
 				log.Println("Warning: Received a Single-Frame before completing the last multi-frame. Previous frame dropped.")
 			}
@@ -316,7 +318,7 @@ func (t *Transport) receiveFromDriver(event *LinEvent) {
 			data := payload[3 : 3+dataLength]
 			t.rxQueue <- &LinMessage{NAD: nad, SID: sid, Data: data}
 
-		case FF:
+		case liniface.FF:
 			if t.remainingBytes > 0 {
 				log.Println("Warning: Received a First-Frame before completing the last one. Previous frame dropped.")
 			}
@@ -333,7 +335,7 @@ func (t *Transport) receiveFromDriver(event *LinEvent) {
 			t.currentNAD = nad
 			t.currentSID = sid
 			t.multiFrameStartTime = time.Now()
-		case CF:
+		case liniface.CF:
 			if t.remainingBytes == 0 {
 				log.Println("Warning: Received a Consecutive-Frame but was not expecting more bytes. Discarding.")
 				t.resetState()

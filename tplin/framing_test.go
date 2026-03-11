@@ -6,24 +6,26 @@ import (
 	"bytes"
 	"testing"
 	"time"
+
+	"github.com/LoveWonYoung/linbuskit/liniface"
 )
 
 // MockLinDriver 是一个简单的测试用模拟驱动
 type MockLinDriver struct {
-	rxEvents  chan *LinEvent
-	txEvents  []*LinEvent
-	responses map[byte]*LinEvent
+	rxEvents  chan *liniface.LinEvent
+	txEvents  []*liniface.LinEvent
+	responses map[byte]*liniface.LinEvent
 }
 
 func NewMockLinDriver() *MockLinDriver {
 	return &MockLinDriver{
-		rxEvents:  make(chan *LinEvent, 50),
-		txEvents:  make([]*LinEvent, 0),
-		responses: make(map[byte]*LinEvent),
+		rxEvents:  make(chan *liniface.LinEvent, 50),
+		txEvents:  make([]*liniface.LinEvent, 0),
+		responses: make(map[byte]*liniface.LinEvent),
 	}
 }
 
-func (d *MockLinDriver) ReadEvent(timeout time.Duration) (*LinEvent, error) {
+func (d *MockLinDriver) ReadEvent(timeout time.Duration) (*liniface.LinEvent, error) {
 	select {
 	case e := <-d.rxEvents:
 		return e, nil
@@ -32,16 +34,16 @@ func (d *MockLinDriver) ReadEvent(timeout time.Duration) (*LinEvent, error) {
 	}
 }
 
-func (d *MockLinDriver) WriteMessage(event *LinEvent) error {
+func (d *MockLinDriver) WriteMessage(event *liniface.LinEvent) error {
 	d.txEvents = append(d.txEvents, event)
 	// 将 TX 事件放回队列供 transport 确认
 	txCopy := *event
-	txCopy.Direction = TX
+	txCopy.Direction = liniface.TX
 	d.rxEvents <- &txCopy
 	return nil
 }
 
-func (d *MockLinDriver) ScheduleSlaveResponse(event *LinEvent) error {
+func (d *MockLinDriver) ScheduleSlaveResponse(event *liniface.LinEvent) error {
 	d.responses[event.EventID] = event
 	return nil
 }
@@ -50,13 +52,13 @@ func (d *MockLinDriver) RequestSlaveResponse(frameID byte) error {
 	if resp, ok := d.responses[frameID]; ok {
 		delete(d.responses, frameID)
 		rxCopy := *resp
-		rxCopy.Direction = RX
+		rxCopy.Direction = liniface.RX
 		d.rxEvents <- &rxCopy
 	}
 	return nil
 }
 
-func (d *MockLinDriver) InjectRxEvent(event *LinEvent) {
+func (d *MockLinDriver) InjectRxEvent(event *liniface.LinEvent) {
 	d.rxEvents <- event
 }
 
@@ -99,7 +101,7 @@ func TestSingleFrameTransmit(t *testing.T) {
 	}
 
 	// PCI: SF (0x0) | length (3 = SID + 2 bytes data)
-	expectedPCI := byte((SF << 4) | 3)
+	expectedPCI := byte((liniface.SF << 4) | 3)
 	if payload[1] != expectedPCI {
 		t.Errorf("PCI错误: 期望 0x%02X, 实际 0x%02X", expectedPCI, payload[1])
 	}
@@ -145,8 +147,8 @@ func TestMultiFrameTransmit(t *testing.T) {
 	ff := driver.txEvents[0]
 	t.Logf("FF: % 02X", ff.EventPayload)
 
-	pciType := PCIType(ff.EventPayload[1] >> 4)
-	if pciType != FF {
+	pciType := liniface.PCIType(ff.EventPayload[1] >> 4)
+	if pciType != liniface.FF {
 		t.Errorf("第一帧类型错误: 期望 FF(1), 实际 %d", pciType)
 	}
 
@@ -155,8 +157,8 @@ func TestMultiFrameTransmit(t *testing.T) {
 		cf := driver.txEvents[i]
 		t.Logf("CF %d: % 02X", i, cf.EventPayload)
 
-		pciType := PCIType(cf.EventPayload[1] >> 4)
-		if pciType != CF {
+		pciType := liniface.PCIType(cf.EventPayload[1] >> 4)
+		if pciType != liniface.CF {
 			t.Errorf("帧 %d 类型错误: 期望 CF(2), 实际 %d", i, pciType)
 		}
 
@@ -188,15 +190,15 @@ func TestSingleFrameReceive(t *testing.T) {
 		sfPayload[i] = 0xFF
 	}
 	sfPayload[0] = nad
-	sfPayload[1] = byte(SF<<4) | byte(len(responseData)+1) // PCI: SF | length
+	sfPayload[1] = byte(liniface.SF<<4) | byte(len(responseData)+1) // PCI: SF | length
 	sfPayload[2] = sid
 	copy(sfPayload[3:], responseData)
 
 	// 注入响应
-	driver.InjectRxEvent(&LinEvent{
+	driver.InjectRxEvent(&liniface.LinEvent{
 		EventID:      SlaveDiagnosticFrameID,
 		EventPayload: sfPayload,
-		Direction:    RX,
+		Direction:    liniface.RX,
 	})
 
 	// 等待处理
@@ -242,15 +244,15 @@ func TestNegativeResponse(t *testing.T) {
 		sfPayload[i] = 0xFF
 	}
 	sfPayload[0] = nad
-	sfPayload[1] = byte((SF << 4) | 3) // PCI: SF | length=3
+	sfPayload[1] = byte((liniface.SF << 4) | 3) // PCI: SF | length=3
 	sfPayload[2] = nrcSid
 	sfPayload[3] = requestSid
 	sfPayload[4] = nrcCode
 
-	driver.InjectRxEvent(&LinEvent{
+	driver.InjectRxEvent(&liniface.LinEvent{
 		EventID:      SlaveDiagnosticFrameID,
 		EventPayload: sfPayload,
-		Direction:    RX,
+		Direction:    liniface.RX,
 	})
 
 	time.Sleep(50 * time.Millisecond)

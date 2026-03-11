@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"testing"
 	"time"
+
+	"github.com/LoveWonYoung/linbuskit/liniface"
 )
 
 // TestLargeMultiFrameAssembly 测试传输层处理一个需要大量连续帧的大型多帧消息。
@@ -48,15 +50,15 @@ func testMultiFrameAssembly(t *testing.T, dataSize int) {
 		ffPayload[i] = 0xFF
 	}
 	ffPayload[0] = originalNad
-	ffPayload[1] = (byte(FF) << 4) | byte(totalLen>>8&0x0F)
+	ffPayload[1] = (byte(liniface.FF) << 4) | byte(totalLen>>8&0x0F)
 	ffPayload[2] = byte(totalLen & 0xFF)
 	ffPayload[3] = originalSid
 	copy(ffPayload[4:], originalData[0:4])
 
-	ffEvent := &LinEvent{
+	ffEvent := &liniface.LinEvent{
 		EventID:      SlaveDiagnosticFrameID,
 		EventPayload: ffPayload,
-		Direction:    RX,
+		Direction:    liniface.RX,
 	}
 
 	// 将第一帧推入队列
@@ -73,7 +75,7 @@ func testMultiFrameAssembly(t *testing.T, dataSize int) {
 			cfPayload[i] = 0xFF
 		}
 		cfPayload[0] = originalNad
-		cfPayload[1] = (byte(CF) << 4) | byte(frameCounter)
+		cfPayload[1] = (byte(liniface.CF) << 4) | byte(frameCounter)
 
 		// 计算这次要发送的数据量
 		chunkEnd := bytesSent + 6
@@ -82,10 +84,10 @@ func testMultiFrameAssembly(t *testing.T, dataSize int) {
 		}
 		copy(cfPayload[2:], originalData[bytesSent:chunkEnd])
 
-		cfEvent := &LinEvent{
+		cfEvent := &liniface.LinEvent{
 			EventID:      SlaveDiagnosticFrameID,
 			EventPayload: cfPayload,
-			Direction:    RX,
+			Direction:    liniface.RX,
 		}
 		// 将连续帧推入队列
 		driver.eventQueue <- cfEvent

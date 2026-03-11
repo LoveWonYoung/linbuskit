@@ -6,6 +6,8 @@ import (
 	"log"
 	"sync"
 	"time"
+
+	"github.com/LoveWonYoung/linbuskit/liniface"
 )
 
 // LinSlave represents the application layer of a LIN slave node.
@@ -28,7 +30,7 @@ type LinSlave struct {
 }
 
 // NewSlave creates and initializes a new LinSlave instance.
-func NewSlave(nad, variantID byte, supplierID, functionID uint16, serialNumber []byte, driver Driver) *LinSlave {
+func NewSlave(nad, variantID byte, supplierID, functionID uint16, serialNumber []byte, driver liniface.Driver) *LinSlave {
 	if serialNumber == nil {
 		serialNumber = []byte{0x01, 0x02, 0x03, 0x04}
 	}

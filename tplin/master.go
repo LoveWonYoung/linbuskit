@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/LoveWonYoung/linbuskit/liniface"
 )
 
 // Pre-defined errors for cleaner API
@@ -38,7 +40,7 @@ type LinMaster struct {
 
 // NewMaster creates and initializes a new LinMaster instance.
 // It starts the underlying transport layer's background processing.
-func NewMaster(driver Driver) *LinMaster {
+func NewMaster(driver liniface.Driver) *LinMaster {
 	// a transport layer instance is created for the master
 	transport := NewTransport(false, driver) // isSlave = false
 	transport.Run()
@@ -49,7 +51,7 @@ func NewMaster(driver Driver) *LinMaster {
 }
 
 // NewMasterWithConfig creates a LinMaster with custom transport configuration.
-func NewMasterWithConfig(driver Driver, config TransportConfig) *LinMaster {
+func NewMasterWithConfig(driver liniface.Driver, config TransportConfig) *LinMaster {
 	transport := NewTransportWithConfig(false, driver, config)
 	transport.Run()
 	return &LinMaster{transport: transport}

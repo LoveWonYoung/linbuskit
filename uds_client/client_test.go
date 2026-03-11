@@ -9,21 +9,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LoveWonYoung/linbuskit/liniface"
 	"github.com/LoveWonYoung/linbuskit/tplin"
 )
 
 // MockUDSDriver 是一个模拟 UDS 从节点的驱动
 type MockUDSDriver struct {
 	mu              sync.Mutex
-	rxQueue         chan *tplin.LinEvent
-	txLog           []*tplin.LinEvent
+	rxQueue         chan *liniface.LinEvent
+	txLog           []*liniface.LinEvent
 	responseHandler func(sid byte, data []byte) (byte, []byte, error)
 }
 
 func NewMockUDSDriver() *MockUDSDriver {
 	return &MockUDSDriver{
-		rxQueue: make(chan *tplin.LinEvent, 50),
-		txLog:   make([]*tplin.LinEvent, 0),
+		rxQueue: make(chan *liniface.LinEvent, 50),
+		txLog:   make([]*liniface.LinEvent, 0),
 	}
 }
 
@@ -35,7 +36,7 @@ func (d *MockUDSDriver) SetHandler(handler func(sid byte, data []byte) (byte, []
 	d.responseHandler = handler
 }
 
-func (d *MockUDSDriver) ReadEvent(timeout time.Duration) (*tplin.LinEvent, error) {
+func (d *MockUDSDriver) ReadEvent(timeout time.Duration) (*liniface.LinEvent, error) {
 	select {
 	case e := <-d.rxQueue:
 		return e, nil
@@ -44,7 +45,7 @@ func (d *MockUDSDriver) ReadEvent(timeout time.Duration) (*tplin.LinEvent, error
 	}
 }
 
-func (d *MockUDSDriver) WriteMessage(event *tplin.LinEvent) error {
+func (d *MockUDSDriver) WriteMessage(event *liniface.LinEvent) error {
 	d.mu.Lock()
 	d.txLog = append(d.txLog, event)
 	handler := d.responseHandler
@@ -52,7 +53,7 @@ func (d *MockUDSDriver) WriteMessage(event *tplin.LinEvent) error {
 
 	// 将 TX 事件放回队列
 	txCopy := *event
-	txCopy.Direction = tplin.TX
+	txCopy.Direction = liniface.TX
 	d.rxQueue <- &txCopy
 
 	// 解析请求并生成响应
@@ -63,7 +64,7 @@ func (d *MockUDSDriver) WriteMessage(event *tplin.LinEvent) error {
 	return nil
 }
 
-func (d *MockUDSDriver) processRequest(event *tplin.LinEvent, handler func(byte, []byte) (byte, []byte, error)) {
+func (d *MockUDSDriver) processRequest(event *liniface.LinEvent, handler func(byte, []byte) (byte, []byte, error)) {
 	payload := event.EventPayload
 	if len(payload) < 3 {
 		return
@@ -71,9 +72,9 @@ func (d *MockUDSDriver) processRequest(event *tplin.LinEvent, handler func(byte,
 
 	nad := payload[0]
 	pci := payload[1]
-	pciType := tplin.PCIType(pci >> 4)
+	pciType := liniface.PCIType(pci >> 4)
 
-	if pciType != tplin.SF {
+	if pciType != liniface.SF {
 		return // 简化处理，只处理单帧
 	}
 
@@ -98,26 +99,26 @@ func (d *MockUDSDriver) processRequest(event *tplin.LinEvent, handler func(byte,
 
 	if err != nil {
 		// 否定响应
-		response[1] = byte((tplin.SF << 4) | 3)
+		response[1] = byte((liniface.SF << 4) | 3)
 		response[2] = 0x7F // NRC SID
 		response[3] = sid
 		response[4] = 0x10 // GeneralReject
 	} else {
 		// 正响应
 		respLen := 1 + len(respData)
-		response[1] = byte(tplin.SF<<4) | byte(respLen)
+		response[1] = byte(liniface.SF<<4) | byte(respLen)
 		response[2] = respSid
 		copy(response[3:], respData)
 	}
 
-	d.rxQueue <- &tplin.LinEvent{
+	d.rxQueue <- &liniface.LinEvent{
 		EventID:      tplin.SlaveDiagnosticFrameID,
 		EventPayload: response,
-		Direction:    tplin.RX,
+		Direction:    liniface.RX,
 	}
 }
 
-func (d *MockUDSDriver) ScheduleSlaveResponse(event *tplin.LinEvent) error {
+func (d *MockUDSDriver) ScheduleSlaveResponse(event *liniface.LinEvent) error {
 	return nil
 }
 

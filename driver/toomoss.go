@@ -15,6 +15,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/LoveWonYoung/linbuskit/liniface"
 	"github.com/LoveWonYoung/linbuskit/tplin"
 	"golang.org/x/sys/windows/registry"
 )
@@ -79,7 +80,7 @@ func archDLLDir() string {
 	if runtime.GOARCH == "386" {
 		return "windows_x86"
 	}
-	return "windows_x64"
+	return ""
 }
 
 func loadDLLs() error {
@@ -109,12 +110,12 @@ func loadDLLs() error {
 	}
 
 	dllDir := archDLLDir()
-	libusbPath := filepath.Join(".\\DLLs", dllDir, "libusb-1.0.dll")
+	libusbPath := filepath.Join(".\\bin", dllDir, "libusb-1.0.dll")
 	if _, err := syscall.LoadLibrary(libusbPath); err != nil {
 		log.Printf("Warning: failed to load libusb-1.0.dll from %s: %v", libusbPath, err)
 	}
 
-	usbPath := filepath.Join(".\\DLLs", dllDir, "USB2XXX.dll")
+	usbPath := filepath.Join(".\\bin", dllDir, "USB2XXX.dll")
 	handle, err := syscall.LoadLibrary(usbPath)
 	if err != nil {
 		return fmt.Errorf("failed to load USB2XXX.dll from %s: %w", usbPath, err)
@@ -451,15 +452,13 @@ type LinExMsg struct {
 }
 
 var (
-	LinChannel      = 0     // 要使用的LIN通道 (0 or 1)
-	Bt         uint = 19200 // LIN总线波特率
-	Master     byte = 1     // 1=Master, 0=Slave
+	LinChannel      = 0
+	Bt         uint = 19200
+	Master     byte = 1
 )
 
-// ToomossDriver implements tplin.Driver using Toomoss LIN interface.
-type ToomossDriver struct {
-	eventChan chan *tplin.LinEvent
-	//mu        sync.Mutex
+type Toomoss struct {
+	eventChan chan *liniface.LinEvent
 }
 
 func ensureLinReady() error {
@@ -469,8 +468,7 @@ func ensureLinReady() error {
 	return nil
 }
 
-// NewToomossDriver 初始化设备并返回驱动实例
-func NewToomossDriver() (*ToomossDriver, error) {
+func NewToomoss() (*Toomoss, error) {
 	if err := ensureLinReady(); err != nil {
 		return nil, err
 	}
@@ -487,26 +485,21 @@ func NewToomossDriver() (*ToomossDriver, error) {
 
 	log.Println("Toomoss LIN device initialized successfully.")
 
-	return &ToomossDriver{
-		eventChan: make(chan *tplin.LinEvent, 10),
+	return &Toomoss{
+		eventChan: make(chan *liniface.LinEvent, 10),
 	}, nil
 }
 
-// impl driver interface
-
-func (d *ToomossDriver) ReadEvent(timeout time.Duration) (*tplin.LinEvent, error) {
+func (d *Toomoss) ReadEvent(timeout time.Duration) (*liniface.LinEvent, error) {
 	select {
 	case event := <-d.eventChan:
 		return event, nil
 	case <-time.After(timeout):
-		return nil, nil // 瓒呮椂鏄甯歌涓猴紝涓嶈繑鍥為敊璇?
+		return nil, nil
 	}
 }
 
-func (d *ToomossDriver) WriteMessage(event *tplin.LinEvent) error {
-	//d.mu.Lock()
-	//defer d.mu.Unlock()
-
+func (d *Toomoss) WriteMessage(event *liniface.LinEvent) error {
 	msg := make([]LinExMsg, 1)
 	outMsg := make([]LinExMsg, 1)
 	var payload [8]byte
@@ -516,7 +509,6 @@ func (d *ToomossDriver) WriteMessage(event *tplin.LinEvent) error {
 	msg[0].DataLen = uint8(len(event.EventPayload))
 	msg[0].PID = event.EventID
 	msg[0].Data = payload
-
 	if event.EventID == tplin.MasterDiagnosticFrameID || event.EventID == tplin.SlaveDiagnosticFrameID {
 		msg[0].CheckType = LIN_EX_CHECK_STD
 	} else {
@@ -527,10 +519,10 @@ func (d *ToomossDriver) WriteMessage(event *tplin.LinEvent) error {
 	if ret <= 0 {
 		return fmt.Errorf("toomoss LIN write failed: ret=%d, err=%v", ret, err)
 	}
-	log.Printf("TX LIN: ID=0x%02X, Len=%02d, CheckSum=%02X, Data=% 02X", event.EventID, outMsg[0].DataLen, outMsg[0].Check, payload[:outMsg[0].DataLen])
+	log.Printf("TX LIN: ID=0x%02X, Len=%02d, CS=%02X, Data=% 02X", event.EventID, outMsg[0].DataLen, outMsg[0].Check, payload[:outMsg[0].DataLen])
 
 	txEvent := *event
-	txEvent.Direction = tplin.TX
+	txEvent.Direction = liniface.TX
 	txEvent.Timestamp = time.Now()
 
 	select {
@@ -540,15 +532,20 @@ func (d *ToomossDriver) WriteMessage(event *tplin.LinEvent) error {
 	return nil
 }
 
-func (d *ToomossDriver) RequestSlaveResponse(frameID byte) error {
-	//d.mu.Lock()
-	//defer d.mu.Unlock()
+func (d *Toomoss) RequestSlaveResponse(frameID byte) error {
 	msg := make([]LinExMsg, 1)
 	outMsg := make([]LinExMsg, 1)
 	msg[0].MsgType = LIN_EX_MSG_TYPE_MR
 	msg[0].PID = frameID
 
-	ret, _, _ := syscall.SyscallN(LinExMasterSync, uintptr(DevHandle[DEVIndex]), uintptr(LinChannel), uintptr(unsafe.Pointer(&msg[0])), uintptr(unsafe.Pointer(&outMsg[0])), uintptr(1))
+	ret, _, _ := syscall.SyscallN(
+		LinExMasterSync,
+		uintptr(DevHandle[DEVIndex]),
+		uintptr(LinChannel),
+		uintptr(unsafe.Pointer(&msg[0])),
+		uintptr(unsafe.Pointer(&outMsg[0])),
+		uintptr(1),
+	)
 
 	if ret <= 0 {
 		log.Printf("RX : 0x%02X (No response from slave)", frameID)
@@ -557,14 +554,14 @@ func (d *ToomossDriver) RequestSlaveResponse(frameID byte) error {
 
 	responseData := outMsg[0].Data
 	dataLen := outMsg[0].DataLen
-	if dataLen != 0 {
-		log.Printf("RX LIN: ID=0x%02X, Len=%02d, CheckSum=%02X, Data=% 02X", frameID, dataLen, outMsg[0].Check, responseData[:dataLen])
+	if ret == 1 {
+		log.Printf("RX LIN: ID=0x%02X, Len=%02d, CS=%02X, Data=% 02X", frameID, dataLen, outMsg[0].Check, responseData[:dataLen])
 	}
 
-	rxEvent := &tplin.LinEvent{
+	rxEvent := &liniface.LinEvent{
 		EventID:      frameID,
 		EventPayload: responseData[:dataLen],
-		Direction:    tplin.RX,
+		Direction:    liniface.RX,
 		Timestamp:    time.Now(),
 	}
 
@@ -576,17 +573,24 @@ func (d *ToomossDriver) RequestSlaveResponse(frameID byte) error {
 	return nil
 }
 
-func (d *ToomossDriver) ScheduleSlaveResponse(event *tplin.LinEvent) error {
-	return errors.New("ToomossDriver: ScheduleSlaveResponse is not supported in Master mode")
+func (d *Toomoss) ScheduleSlaveResponse(event *liniface.LinEvent) error {
+	return errors.New("toomoss: ScheduleSlaveResponse is not supported in Master mode")
 }
 
-func (d *ToomossDriver) LinBreak() bool {
+func (d *Toomoss) LinBreak() bool {
 	LinBreak := make([]LinExMsg, 1)
 	LINOutBreak := make([]LinExMsg, 1)
 	LinBreak[0].MsgType = LIN_EX_MSG_TYPE_BK
 	LinBreak[0].Timestamp = 20
 
-	if sendNum, _, _ := syscall.SyscallN(LinExMasterSync, uintptr(DevHandle[DEVIndex]), uintptr(LinChannel), uintptr(unsafe.Pointer(&LinBreak[0])), uintptr(unsafe.Pointer(&LINOutBreak[0])), uintptr(1)); sendNum <= 0 {
+	if sendNum, _, _ := syscall.SyscallN(
+		LinExMasterSync,
+		uintptr(DevHandle[DEVIndex]),
+		uintptr(LinChannel),
+		uintptr(unsafe.Pointer(&LinBreak[0])),
+		uintptr(unsafe.Pointer(&LINOutBreak[0])),
+		uintptr(1),
+	); sendNum <= 0 {
 		log.Println("LIN break failed")
 		return false
 	}
