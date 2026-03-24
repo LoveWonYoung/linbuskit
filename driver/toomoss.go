@@ -33,6 +33,66 @@ var (
 	toomossMu sync.Mutex
 )
 
+const (
+	LIN_EX_SUCCESS = -iota
+	LIN_EX_ERR_NOT_SUPPORT
+	LIN_EX_ERR_USB_WRITE_FAIL
+	LIN_EX_ERR_USB_READ_FAIL
+	LIN_EX_ERR_CMD_FAIL
+	LIN_EX_ERR_CH_NO_INIT
+	LIN_EX_ERR_READ_DATA
+	LIN_EX_ERR_PARAMETER
+)
+
+const (
+	LIN_EX_MSG_TYPE_UN = iota
+	LIN_EX_MSG_TYPE_MW
+	LIN_EX_MSG_TYPE_MR
+	LIN_EX_MSG_TYPE_SW
+	LIN_EX_MSG_TYPE_SR
+	LIN_EX_MSG_TYPE_BK
+	LIN_EX_MSG_TYPE_SY
+	LIN_EX_MSG_TYPE_ID
+	LIN_EX_MSG_TYPE_DT
+	LIN_EX_MSG_TYPE_CK
+	LIN_EX_CHECK_STD   = iota - 10 // 标准校验，不含PID
+	LIN_EX_CHECK_EXT               // 增强校验，含PID
+	LIN_EX_CHECK_USER              // 自定义校验类型，需要用户自行计算并传入Check，不进行自动校验
+	LIN_EX_CHECK_NONE              // 不进行校验数据
+	LIN_EX_CHECK_ERROR             // 接收数据校验错误
+)
+
+type LinExMsg struct {
+	Timestamp uint32
+	MsgType   uint8
+	CheckType uint8
+	DataLen   uint8
+	Sync      uint8
+	PID       uint8
+	Data      [8]uint8
+	Check     uint8
+	BreakBits uint8
+	Reserve1  uint8
+}
+type ToomossCh byte
+
+const (
+	CH1 ToomossCh = iota
+	CH2
+	CH3
+	CH4
+)
+
+var (
+	Bt     uint = 19200
+	Master byte = 1
+)
+
+type Toomoss struct {
+	eventChan chan *liniface.LinEvent
+	channel   ToomossCh
+}
+
 func toomossReady() bool {
 	return UsbDeviceDLL != 0 &&
 		UsbScanDevice != 0 &&
@@ -401,66 +461,6 @@ func usbClose() error {
 	return nil
 }
 
-func UsbClose() bool {
-	if err := usbClose(); err != nil {
-		log.Printf("USB close failed: %v", err)
-		return false
-	}
-	return true
-}
-
-const (
-	LIN_EX_SUCCESS = -iota
-	LIN_EX_ERR_NOT_SUPPORT
-	LIN_EX_ERR_USB_WRITE_FAIL
-	LIN_EX_ERR_USB_READ_FAIL
-	LIN_EX_ERR_CMD_FAIL
-	LIN_EX_ERR_CH_NO_INIT
-	LIN_EX_ERR_READ_DATA
-	LIN_EX_ERR_PARAMETER
-)
-
-const (
-	LIN_EX_MSG_TYPE_UN = iota
-	LIN_EX_MSG_TYPE_MW
-	LIN_EX_MSG_TYPE_MR
-	LIN_EX_MSG_TYPE_SW
-	LIN_EX_MSG_TYPE_SR
-	LIN_EX_MSG_TYPE_BK
-	LIN_EX_MSG_TYPE_SY
-	LIN_EX_MSG_TYPE_ID
-	LIN_EX_MSG_TYPE_DT
-	LIN_EX_MSG_TYPE_CK
-	LIN_EX_CHECK_STD   = iota - 10 // 标准校验，不含PID
-	LIN_EX_CHECK_EXT               // 增强校验，含PID
-	LIN_EX_CHECK_USER              // 自定义校验类型，需要用户自行计算并传入Check，不进行自动校验
-	LIN_EX_CHECK_NONE              // 不进行校验数据
-	LIN_EX_CHECK_ERROR             // 接收数据校验错误
-)
-
-type LinExMsg struct {
-	Timestamp uint32
-	MsgType   uint8
-	CheckType uint8
-	DataLen   uint8
-	Sync      uint8
-	PID       uint8
-	Data      [8]uint8
-	Check     uint8
-	BreakBits uint8
-	Reserve1  uint8
-}
-
-var (
-	LinChannel      = 0
-	Bt         uint = 19200
-	Master     byte = 1
-)
-
-type Toomoss struct {
-	eventChan chan *liniface.LinEvent
-}
-
 func ensureLinReady() error {
 	if err := ensureToomossLoaded(); err != nil {
 		return fmt.Errorf("load Toomoss LIN DLLs: %w", err)
@@ -468,7 +468,7 @@ func ensureLinReady() error {
 	return nil
 }
 
-func NewToomoss() (*Toomoss, error) {
+func NewToomoss(channel ToomossCh) (*Toomoss, error) {
 	if err := ensureLinReady(); err != nil {
 		return nil, err
 	}
@@ -479,7 +479,7 @@ func NewToomoss() (*Toomoss, error) {
 		return nil, fmt.Errorf("USB open failed")
 	}
 
-	if tmsInit, ret, err := syscall.SyscallN(LinExInit, uintptr(DevHandle[DEVIndex]), uintptr(LinChannel), uintptr(Bt), uintptr(Master)); tmsInit != 0 {
+	if tmsInit, ret, err := syscall.SyscallN(LinExInit, uintptr(DevHandle[DEVIndex]), uintptr(channel), uintptr(Bt), uintptr(Master)); tmsInit != 0 {
 		return nil, fmt.Errorf("failed to initialize Toomoss LIN device: ret=%d, err=%v", ret, err)
 	}
 
@@ -487,6 +487,7 @@ func NewToomoss() (*Toomoss, error) {
 
 	return &Toomoss{
 		eventChan: make(chan *liniface.LinEvent, 10),
+		channel:   channel,
 	}, nil
 }
 
@@ -515,7 +516,7 @@ func (d *Toomoss) WriteMessage(event *liniface.LinEvent) error {
 		msg[0].CheckType = LIN_EX_CHECK_EXT
 	}
 
-	ret, _, err := syscall.SyscallN(LinExMasterSync, uintptr(DevHandle[DEVIndex]), uintptr(LinChannel), uintptr(unsafe.Pointer(&msg[0])), uintptr(unsafe.Pointer(&outMsg[0])), uintptr(1))
+	ret, _, err := syscall.SyscallN(LinExMasterSync, uintptr(DevHandle[DEVIndex]), uintptr(d.channel), uintptr(unsafe.Pointer(&msg[0])), uintptr(unsafe.Pointer(&outMsg[0])), uintptr(1))
 	if ret <= 0 {
 		return fmt.Errorf("toomoss LIN write failed: ret=%d, err=%v", ret, err)
 	}
@@ -541,7 +542,7 @@ func (d *Toomoss) RequestSlaveResponse(frameID byte) error {
 	ret, _, _ := syscall.SyscallN(
 		LinExMasterSync,
 		uintptr(DevHandle[DEVIndex]),
-		uintptr(LinChannel),
+		uintptr(d.channel),
 		uintptr(unsafe.Pointer(&msg[0])),
 		uintptr(unsafe.Pointer(&outMsg[0])),
 		uintptr(1),
@@ -586,7 +587,7 @@ func (d *Toomoss) LinBreak() bool {
 	if sendNum, _, _ := syscall.SyscallN(
 		LinExMasterSync,
 		uintptr(DevHandle[DEVIndex]),
-		uintptr(LinChannel),
+		uintptr(d.channel),
 		uintptr(unsafe.Pointer(&LinBreak[0])),
 		uintptr(unsafe.Pointer(&LINOutBreak[0])),
 		uintptr(1),
