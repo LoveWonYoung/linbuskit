@@ -578,6 +578,11 @@ func (d *Toomoss) ScheduleSlaveResponse(event *liniface.LinEvent) error {
 	return errors.New("toomoss: ScheduleSlaveResponse is not supported in Master mode")
 }
 
+// Close releases the USB adapter and loaded driver library.
+func (d *Toomoss) Close() error {
+	return usbClose()
+}
+
 func (d *Toomoss) LinBreak() bool {
 	LinBreak := make([]LinExMsg, 1)
 	LINOutBreak := make([]LinExMsg, 1)
