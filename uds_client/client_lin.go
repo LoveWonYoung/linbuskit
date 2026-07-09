@@ -15,6 +15,8 @@ type ClientConfig struct {
 	TargetNad      byte
 	DefaultTimeout time.Duration
 	MaxRetries     int
+	// ContinuousSlavePoll 透传到 Transport：true 时空闲也持续请求 0x3D。
+	ContinuousSlavePoll bool
 }
 
 // DefaultClientConfig returns a configuration with sensible defaults.
@@ -39,7 +41,9 @@ func NewClient(driver liniface.Driver, targetNad byte) *Client {
 
 // NewClientWithConfig 使用自定义配置创建客户端。
 func NewClientWithConfig(driver liniface.Driver, config ClientConfig) *Client {
-	master := tplin.NewMaster(driver)
+	tpCfg := tplin.DefaultTransportConfig()
+	tpCfg.ContinuousSlavePoll = config.ContinuousSlavePoll
+	master := tplin.NewMasterWithConfig(driver, tpCfg)
 	return &Client{
 		master: master,
 		config: config,
@@ -87,6 +91,8 @@ func (c *Client) sendAndRec(ctx context.Context, nad byte, payload []byte) ([]by
 	sid := payload[0]
 	data := payload[1:]
 	c.master.SendDiagnostic(nad, sid, data)
+	// 无论成功/失败/超时，结束本次会话后停止空闲 0x3D 轮询（ContinuousSlavePoll=false 时生效）。
+	defer c.master.StopAwaitingSlaveResponse()
 
 	// 3. 轮询等待响应，支持超时/NRC/响应挂起处理。
 	ticker := time.NewTicker(2 * time.Millisecond)
@@ -106,7 +112,7 @@ func (c *Client) sendAndRec(ctx context.Context, nad byte, payload []byte) ([]by
 			}
 			if msg.SID == 0x7F { // Negative Response
 				if len(msg.Data) >= 2 && msg.Data[0] == sid && msg.Data[1] == 0x78 {
-					// Response Pending, 继续等待
+					// Response Pending, 继续等待（仍保持 awaiting，继续读 0x3D）
 					continue
 				}
 				fullNrcResponse := append([]byte{msg.SID}, msg.Data...)

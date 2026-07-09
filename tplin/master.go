@@ -63,6 +63,11 @@ func (m *LinMaster) Close() {
 	m.transport.Close()
 }
 
+// StopAwaitingSlaveResponse stops requesting 0x3D when ContinuousSlavePoll is disabled.
+func (m *LinMaster) StopAwaitingSlaveResponse() {
+	m.transport.StopAwaitingSlaveResponse()
+}
+
 // waitForResponse is a helper function that waits for a specific response SID.
 // This is the Go equivalent of the blocking while-loops in the Python version.
 func (m *LinMaster) waitForResponse(expectedRsid byte, timeout time.Duration) (*LinMessage, error) {
@@ -112,8 +117,10 @@ func (m *LinMaster) AssignSlaveNad(newNad byte, supplierID, functionID uint16, n
 
 	msg, err := m.waitForResponse(byte(sid)+0x40, timeout)
 	if err != nil {
+		m.transport.StopAwaitingSlaveResponse()
 		return 0, err
 	}
+	m.transport.StopAwaitingSlaveResponse()
 	return msg.NAD, nil
 }
 
@@ -129,8 +136,10 @@ func (m *LinMaster) ReadByIdentifier(identifier byte, supplierID, functionID uin
 
 	msg, err := m.waitForResponse(byte(sid)+0x40, timeout)
 	if err != nil {
+		m.transport.StopAwaitingSlaveResponse()
 		return 0, nil, err
 	}
+	m.transport.StopAwaitingSlaveResponse()
 	return msg.NAD, msg.Data, nil
 }
 

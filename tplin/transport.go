@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/LoveWonYoung/linbuskit/liniface"
@@ -50,6 +51,10 @@ type Transport struct {
 	rxQueue          chan *LinMessage
 	config           TransportConfig
 	scheduledTxEvent *liniface.LinEvent
+
+	// awaitingSlaveResponse 标记 Master 是否正在等待从节点诊断响应。
+	// ContinuousSlavePoll=false 时，仅在此标志为 true（或未完成多帧）时才请求 0x3D。
+	awaitingSlaveResponse atomic.Bool
 
 	// State for multi-frame reception (RWMutex for better concurrency)
 	stateMutex          sync.RWMutex
@@ -160,12 +165,38 @@ func (t *Transport) execute() error {
 				return fmt.Errorf("master failed to write message: %w", err)
 			}
 		default:
-			if err := t.driver.RequestSlaveResponse(SlaveDiagnosticFrameID); err != nil {
-				return fmt.Errorf("master failed to request slave response: %w", err)
+			if t.shouldRequestSlaveResponse() {
+				if err := t.driver.RequestSlaveResponse(SlaveDiagnosticFrameID); err != nil {
+					return fmt.Errorf("master failed to request slave response: %w", err)
+				}
 			}
 		}
 	}
 	return nil
+}
+
+// shouldRequestSlaveResponse 决定 Master 空闲时是否请求 0x3D。
+func (t *Transport) shouldRequestSlaveResponse() bool {
+	if t.config.ContinuousSlavePoll {
+		return true
+	}
+	if t.awaitingSlaveResponse.Load() {
+		return true
+	}
+	t.stateMutex.RLock()
+	ongoing := t.remainingBytes > 0
+	t.stateMutex.RUnlock()
+	return ongoing
+}
+
+// SetAwaitingSlaveResponse 设置是否正在等待从节点诊断响应。
+func (t *Transport) SetAwaitingSlaveResponse(awaiting bool) {
+	t.awaitingSlaveResponse.Store(awaiting)
+}
+
+// StopAwaitingSlaveResponse 停止等待从节点响应，从而在非持续轮询模式下停止请求 0x3D。
+func (t *Transport) StopAwaitingSlaveResponse() {
+	t.awaitingSlaveResponse.Store(false)
 }
 
 // checkMultiFrameTimeout 检查多帧接收是否超时
@@ -220,6 +251,8 @@ func (t *Transport) Transmit(nad, sid byte, data []byte) {
 		eventID = SlaveDiagnosticFrameID
 	} else {
 		eventID = MasterDiagnosticFrameID
+		// Master 发出诊断请求后，默认进入等待从节点响应状态。
+		t.awaitingSlaveResponse.Store(true)
 	}
 	dataLen := len(data) + 1
 	if dataLen <= 6 {
