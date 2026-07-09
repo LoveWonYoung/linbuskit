@@ -532,6 +532,60 @@ func (d *Toomoss) WriteMessage(event *liniface.LinEvent) error {
 	}
 	return nil
 }
+func (d *Toomoss) MasterWrite(frameID byte, data []byte) error {
+	if len(data) > 8 {
+		return fmt.Errorf("toomoss MasterWrite: data length %d exceeds 8", len(data))
+	}
+
+	msg := make([]LinExMsg, 1)
+	outMsg := make([]LinExMsg, 1)
+	var payload [8]byte
+	copy(payload[:], data)
+
+	msg[0].MsgType = LIN_EX_MSG_TYPE_MW
+	msg[0].DataLen = uint8(len(data))
+	msg[0].PID = frameID
+	msg[0].Data = payload
+	if frameID == tplin.MasterDiagnosticFrameID || frameID == tplin.SlaveDiagnosticFrameID {
+		msg[0].CheckType = LIN_EX_CHECK_STD
+	} else {
+		msg[0].CheckType = LIN_EX_CHECK_EXT
+	}
+
+	ret, _, err := syscall.SyscallN(LinExMasterSync, uintptr(DevHandle[DEVIndex]), uintptr(d.channel), uintptr(unsafe.Pointer(&msg[0])), uintptr(unsafe.Pointer(&outMsg[0])), uintptr(1))
+	if ret <= 0 {
+		return fmt.Errorf("toomoss LIN write failed: ret=%d, err=%v", ret, err)
+	}
+	return nil
+}
+
+func (d *Toomoss) MasterRead(frameID byte) ([]byte, error) {
+	msg := make([]LinExMsg, 1)
+	outMsg := make([]LinExMsg, 1)
+	msg[0].MsgType = LIN_EX_MSG_TYPE_MR
+	msg[0].PID = frameID
+
+	ret, _, _ := syscall.SyscallN(
+		LinExMasterSync,
+		uintptr(DevHandle[DEVIndex]),
+		uintptr(d.channel),
+		uintptr(unsafe.Pointer(&msg[0])),
+		uintptr(unsafe.Pointer(&outMsg[0])),
+		uintptr(1),
+	)
+
+	if ret <= 0 {
+		return nil, errors.New("no response from slave")
+	}
+
+	dataLen := int(outMsg[0].DataLen)
+	if dataLen > len(outMsg[0].Data) {
+		dataLen = len(outMsg[0].Data)
+	}
+	result := make([]byte, dataLen)
+	copy(result, outMsg[0].Data[:dataLen])
+	return result, nil
+}
 
 func (d *Toomoss) RequestSlaveResponse(frameID byte) error {
 	msg := make([]LinExMsg, 1)
