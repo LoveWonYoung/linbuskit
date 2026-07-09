@@ -123,8 +123,15 @@ func (t *Transport) Close() {
 // execute is the main processing loop called periodically by the background goroutine.
 func (t *Transport) execute() error {
 	t.checkMultiFrameTimeout()
+
+	readTimeout := t.config.ReadTimeout
+	if !t.isSlave && len(t.txQueue) > 0 {
+		// 待发 0x3C 时不阻塞读，避免 ReadTimeout 叠加 PollInterval 导致帧间隔 ~18ms。
+		readTimeout = 0
+	}
+
 	for {
-		event, err := t.driver.ReadEvent(t.config.ReadTimeout)
+		event, err := t.driver.ReadEvent(readTimeout)
 		if err != nil {
 			return fmt.Errorf("failed to read event from driver: %w", err)
 		}
