@@ -520,8 +520,7 @@ func (d *Toomoss) WriteMessage(event *liniface.LinEvent) error {
 	if ret <= 0 {
 		return fmt.Errorf("toomoss LIN write failed: ret=%d, err=%v", ret, err)
 	}
-	log.Printf("TX LIN: ID=0x%02X, Len=%02d, CS=%02X, Data=% 02X", event.EventID, outMsg[0].DataLen, outMsg[0].Check, payload[:outMsg[0].DataLen])
-
+	logLINMessage("TX", event.EventID, outMsg[0].DataLen, outMsg[0].Check, payload[:outMsg[0].DataLen])
 	txEvent := *event
 	txEvent.Direction = liniface.TX
 	txEvent.Timestamp = time.Now()
@@ -556,6 +555,7 @@ func (d *Toomoss) MasterWrite(frameID byte, data []byte) error {
 	if ret <= 0 {
 		return fmt.Errorf("toomoss LIN write failed: ret=%d, err=%v", ret, err)
 	}
+	logLINMessage("TX", frameID, outMsg[0].DataLen, outMsg[0].Check, payload[:outMsg[0].DataLen])
 	return nil
 }
 
@@ -584,6 +584,7 @@ func (d *Toomoss) MasterRead(frameID byte) ([]byte, error) {
 	}
 	result := make([]byte, dataLen)
 	copy(result, outMsg[0].Data[:dataLen])
+	logLINMessage("RX", frameID, byte(dataLen), outMsg[0].Check, outMsg[0].Data[:dataLen])
 	return result, nil
 }
 
@@ -610,7 +611,7 @@ func (d *Toomoss) RequestSlaveResponse(frameID byte) error {
 	responseData := outMsg[0].Data
 	dataLen := outMsg[0].DataLen
 	if ret == 1 {
-		log.Printf("RX LIN: ID=0x%02X, Len=%02d, CS=%02X, Data=% 02X", frameID, dataLen, outMsg[0].Check, responseData[:dataLen])
+		logLINMessage("RX", frameID, dataLen, outMsg[0].Check, responseData[:dataLen])
 	}
 
 	rxEvent := &liniface.LinEvent{
@@ -637,7 +638,7 @@ func (d *Toomoss) Close() error {
 	return usbClose()
 }
 
-func (d *Toomoss) LinBreak() bool {
+func (d *Toomoss) LinBreak() error {
 	LinBreak := make([]LinExMsg, 1)
 	LINOutBreak := make([]LinExMsg, 1)
 	LinBreak[0].MsgType = LIN_EX_MSG_TYPE_BK
@@ -651,8 +652,7 @@ func (d *Toomoss) LinBreak() bool {
 		uintptr(unsafe.Pointer(&LINOutBreak[0])),
 		uintptr(1),
 	); sendNum <= 0 {
-		log.Println("LIN break failed")
-		return false
+		return errors.New("LIN break failed")
 	}
-	return true
+	return nil
 }
