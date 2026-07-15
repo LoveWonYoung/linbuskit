@@ -508,6 +508,13 @@ func (d *Toomoss) RequestSlaveResponse(frameID byte) error {
 
 	responseData := outMsg[0].Data
 	dataLen := outMsg[0].DataLen
+	if int(dataLen) > len(responseData) {
+		dataLen = byte(len(responseData))
+	}
+	if dataLen == 0 {
+		log.Printf("RX : 0x%02X (No response from slave)", frameID)
+		return nil
+	}
 	if ret == 1 {
 		logLINMessage("RX", frameID, dataLen, outMsg[0].Check, responseData[:dataLen])
 	}
