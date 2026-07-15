@@ -130,8 +130,8 @@ func (t *Transport) execute() error {
 	t.checkMultiFrameTimeout()
 
 	readTimeout := t.config.ReadTimeout
-	if !t.isSlave && len(t.txQueue) > 0 {
-		// 待发 0x3C 时不阻塞读，避免 ReadTimeout 叠加 PollInterval 导致帧间隔 ~18ms。
+	if !t.isSlave && (len(t.txQueue) > 0 || t.shouldRequestSlaveResponse()) {
+		// 待发 0x3C 或即将请求 0x3D 时不阻塞读，避免 ReadTimeout 叠加 PollInterval 导致帧间隔 ~18ms。
 		readTimeout = 0
 	}
 

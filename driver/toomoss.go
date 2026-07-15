@@ -491,6 +491,24 @@ func NewToomoss(channel ToomossCh) (*Toomoss, error) {
 	}, nil
 }
 
+func (d *Toomoss) LinMasterSync(msg, outMsg []LinExMsg) (uintptr, error) {
+	if len(outMsg) == 0 || len(msg) == 0 {
+		return 0, fmt.Errorf("LinMasterSync called with empty outMsg")
+	}
+	if len(msg) != len(outMsg) {
+		return 0, fmt.Errorf("LinMasterSync: len(msg) != len(outMsg)")
+	}
+	ret, _, err := syscall.SyscallN(
+		LinExMasterSync,
+		uintptr(DevHandle[DEVIndex]),
+		uintptr(d.channel),
+		uintptr(unsafe.Pointer(&msg[0])),
+		uintptr(unsafe.Pointer(&outMsg[0])),
+		uintptr(len(msg)),
+	)
+	return ret, err
+}
+
 func (d *Toomoss) ReadEvent(timeout time.Duration) (*liniface.LinEvent, error) {
 	select {
 	case event := <-d.eventChan:
@@ -550,8 +568,8 @@ func (d *Toomoss) MasterWrite(frameID byte, data []byte) error {
 	} else {
 		msg[0].CheckType = LIN_EX_CHECK_EXT
 	}
+	ret, err := d.LinMasterSync(msg, outMsg)
 
-	ret, _, err := syscall.SyscallN(LinExMasterSync, uintptr(DevHandle[DEVIndex]), uintptr(d.channel), uintptr(unsafe.Pointer(&msg[0])), uintptr(unsafe.Pointer(&outMsg[0])), uintptr(1))
 	if ret <= 0 {
 		return fmt.Errorf("toomoss LIN write failed: ret=%d, err=%v", ret, err)
 	}
@@ -564,15 +582,7 @@ func (d *Toomoss) MasterRead(frameID byte) ([]byte, error) {
 	outMsg := make([]LinExMsg, 1)
 	msg[0].MsgType = LIN_EX_MSG_TYPE_MR
 	msg[0].PID = frameID
-
-	ret, _, _ := syscall.SyscallN(
-		LinExMasterSync,
-		uintptr(DevHandle[DEVIndex]),
-		uintptr(d.channel),
-		uintptr(unsafe.Pointer(&msg[0])),
-		uintptr(unsafe.Pointer(&outMsg[0])),
-		uintptr(1),
-	)
+	ret, _ := d.LinMasterSync(msg, outMsg)
 
 	if ret <= 0 {
 		return nil, errors.New("no response from slave")
@@ -593,15 +603,7 @@ func (d *Toomoss) RequestSlaveResponse(frameID byte) error {
 	outMsg := make([]LinExMsg, 1)
 	msg[0].MsgType = LIN_EX_MSG_TYPE_MR
 	msg[0].PID = frameID
-
-	ret, _, _ := syscall.SyscallN(
-		LinExMasterSync,
-		uintptr(DevHandle[DEVIndex]),
-		uintptr(d.channel),
-		uintptr(unsafe.Pointer(&msg[0])),
-		uintptr(unsafe.Pointer(&outMsg[0])),
-		uintptr(1),
-	)
+	ret, _ := d.LinMasterSync(msg, outMsg)
 
 	if ret <= 0 {
 		log.Printf("RX : 0x%02X (No response from slave)", frameID)
@@ -639,19 +641,11 @@ func (d *Toomoss) Close() error {
 }
 
 func (d *Toomoss) LinBreak() error {
-	LinBreak := make([]LinExMsg, 1)
-	LINOutBreak := make([]LinExMsg, 1)
-	LinBreak[0].MsgType = LIN_EX_MSG_TYPE_BK
-	LinBreak[0].Timestamp = 20
-
-	if sendNum, _, _ := syscall.SyscallN(
-		LinExMasterSync,
-		uintptr(DevHandle[DEVIndex]),
-		uintptr(d.channel),
-		uintptr(unsafe.Pointer(&LinBreak[0])),
-		uintptr(unsafe.Pointer(&LINOutBreak[0])),
-		uintptr(1),
-	); sendNum <= 0 {
+	msg := make([]LinExMsg, 1)
+	outMsg := make([]LinExMsg, 1)
+	msg[0].MsgType = LIN_EX_MSG_TYPE_BK
+	msg[0].Timestamp = 20
+	if ret, _ := d.LinMasterSync(msg, outMsg); ret <= 0 {
 		return errors.New("LIN break failed")
 	}
 	return nil
