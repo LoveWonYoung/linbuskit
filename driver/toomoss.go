@@ -21,14 +21,15 @@ import (
 )
 
 var (
-	UsbDeviceDLL    syscall.Handle
-	UsbScanDevice   uintptr
-	UsbOpenDevice   uintptr
-	UsbCloseDevice  uintptr
-	LinExInit       uintptr
-	LinExMasterSync uintptr
-	DevHandle       [10]int
-	DEVIndex        = 0
+	UsbDeviceDLL      syscall.Handle
+	UsbScanDevice     uintptr
+	UsbOpenDevice     uintptr
+	UsbCloseDevice    uintptr
+	LinExInit         uintptr
+	LinExMasterSync   uintptr
+	LinEXSlaveGetData uintptr
+	DevHandle         [10]int
+	DEVIndex          = 0
 
 	toomossMu sync.Mutex
 )
@@ -84,8 +85,9 @@ const (
 )
 
 var (
-	Bt     uint = 19200
-	Master byte = 1
+	Bt        uint = 19200
+	Master    byte = 1
+	SlaveMode byte = 0
 )
 
 type Toomoss struct {
@@ -99,7 +101,8 @@ func toomossReady() bool {
 		UsbOpenDevice != 0 &&
 		UsbCloseDevice != 0 &&
 		LinExInit != 0 &&
-		LinExMasterSync != 0
+		LinExMasterSync != 0 &&
+		LinEXSlaveGetData != 0
 }
 
 func resetToomossState() {
@@ -109,6 +112,7 @@ func resetToomossState() {
 	UsbCloseDevice = 0
 	LinExInit = 0
 	LinExMasterSync = 0
+	LinEXSlaveGetData = 0
 }
 
 func ensureToomossLoaded() error {
@@ -219,7 +223,9 @@ func loadProcAddresses() error {
 	if LinExMasterSync, err = getProc("LIN_EX_MasterSync"); err != nil {
 		errs = append(errs, err.Error())
 	}
-
+	if LinEXSlaveGetData, err = getProc("LIN_EX_SlaveGetData"); err != nil {
+		errs = append(errs, err.Error())
+	}
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, "; "))
 	}
@@ -468,7 +474,7 @@ func ensureLinReady() error {
 	return nil
 }
 
-func NewToomoss(channel ToomossCh) (*Toomoss, error) {
+func NewToomoss(channel ToomossCh, mode byte) (*Toomoss, error) {
 	if err := ensureLinReady(); err != nil {
 		return nil, err
 	}
@@ -479,7 +485,7 @@ func NewToomoss(channel ToomossCh) (*Toomoss, error) {
 		return nil, fmt.Errorf("USB open failed")
 	}
 
-	if tmsInit, ret, err := syscall.SyscallN(LinExInit, uintptr(DevHandle[DEVIndex]), uintptr(channel), uintptr(Bt), uintptr(Master)); tmsInit != 0 {
+	if tmsInit, ret, err := syscall.SyscallN(LinExInit, uintptr(DevHandle[DEVIndex]), uintptr(channel), uintptr(Bt), uintptr(mode)); tmsInit != 0 {
 		return nil, fmt.Errorf("failed to initialize Toomoss LIN device: ret=%d, err=%v", ret, err)
 	}
 
@@ -656,4 +662,32 @@ func (d *Toomoss) LinBreak() error {
 		return errors.New("LIN break failed")
 	}
 	return nil
+}
+
+const linExSlaveGetDataMaxFrames = 512
+
+func (d *Toomoss) LinExSlaveGetData() ([]LinExMsg, error) {
+	if LinEXSlaveGetData == 0 {
+		return nil, errors.New("LIN_EX_SlaveGetData not loaded")
+	}
+
+	linMsgs := make([]LinExMsg, linExSlaveGetDataMaxFrames)
+	ret, _, callErr := syscall.SyscallN(
+		LinEXSlaveGetData,
+		uintptr(DevHandle[DEVIndex]),
+		uintptr(d.channel),
+		uintptr(unsafe.Pointer(&linMsgs[0])),
+	)
+	if callErr != 0 {
+		return nil, fmt.Errorf("LIN_EX_SlaveGetData syscall failed: %w", callErr)
+	}
+	if int(ret) < 0 {
+		return nil, fmt.Errorf("LIN_EX_SlaveGetData failed: ret=%d", int(ret))
+	}
+
+	count := int(ret)
+	if count > len(linMsgs) {
+		count = len(linMsgs)
+	}
+	return linMsgs[:count], nil
 }

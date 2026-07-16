@@ -30,6 +30,7 @@ typedef bool (*fn_USB_CloseDevice)(int DevHandle);
 
 typedef int (*fn_LIN_EX_Init)(int DevHandle,unsigned char LINIndex,unsigned int BaudRate,unsigned char MasterMode);
 typedef int (*fn_LIN_EX_MasterSync)(int DevHandle,unsigned char LINIndex,LIN_EX_MSG *pInMsg,LIN_EX_MSG *pOutMsg,unsigned int MsgLen);
+typedef int (*fn_LIN_EX_SlaveGetData)(int DevHandle,unsigned char LINIndex,LIN_EX_MSG *pLINMsg);
 
 static void* g_libusb = NULL;
 static void* g_usb2xxx = NULL;
@@ -39,6 +40,7 @@ static fn_USB_OpenDevice pUSB_OpenDevice = NULL;
 static fn_USB_CloseDevice pUSB_CloseDevice = NULL;
 static fn_LIN_EX_Init pLIN_EX_Init = NULL;
 static fn_LIN_EX_MasterSync pLIN_EX_MasterSync = NULL;
+static fn_LIN_EX_SlaveGetData pLIN_EX_SlaveGetData = NULL;
 
 void toomoss_unload();
 
@@ -91,6 +93,7 @@ int toomoss_load(const char* libusb_path, const char* usb2xxx_path, char* errbuf
 	LOAD_SYMBOL(pUSB_CloseDevice, fn_USB_CloseDevice, "USB_CloseDevice", errbuf, errlen);
 	LOAD_SYMBOL(pLIN_EX_Init, fn_LIN_EX_Init, "LIN_EX_Init", errbuf, errlen);
 	LOAD_SYMBOL(pLIN_EX_MasterSync, fn_LIN_EX_MasterSync, "LIN_EX_MasterSync", errbuf, errlen);
+	LOAD_SYMBOL(pLIN_EX_SlaveGetData, fn_LIN_EX_SlaveGetData, "LIN_EX_SlaveGetData", errbuf, errlen);
 	return 0;
 }
 
@@ -100,6 +103,7 @@ void toomoss_unload() {
 	pUSB_CloseDevice = NULL;
 	pLIN_EX_Init = NULL;
 	pLIN_EX_MasterSync = NULL;
+	pLIN_EX_SlaveGetData = NULL;
 
 	if (g_usb2xxx != NULL) {
 		dlclose(g_usb2xxx);
@@ -134,6 +138,11 @@ int toomoss_lin_ex_init(int DevHandle, unsigned char LINIndex, unsigned int Baud
 int toomoss_lin_ex_master_sync(int DevHandle, unsigned char LINIndex, LIN_EX_MSG *pInMsg, LIN_EX_MSG *pOutMsg, unsigned int MsgLen) {
 	if (pLIN_EX_MasterSync == NULL) return -1;
 	return pLIN_EX_MasterSync(DevHandle, LINIndex, pInMsg, pOutMsg, MsgLen);
+}
+
+int toomoss_lin_ex_slave_get_data(int DevHandle, unsigned char LINIndex, LIN_EX_MSG *pLINMsg) {
+	if (pLIN_EX_SlaveGetData == NULL) return -1;
+	return pLIN_EX_SlaveGetData(DevHandle, LINIndex, pLINMsg);
 }
 */
 import "C"
@@ -552,4 +561,32 @@ func (d *Toomoss) LinBreak() error {
 		return errors.New("LIN break failed")
 	}
 	return nil
+}
+
+const linExSlaveGetDataMaxFrames = 512
+
+func (d *Toomoss) LinExSlaveGetData() ([]LinExMsg, error) {
+	if err := ensureToomossLoaded(); err != nil {
+		return nil, err
+	}
+
+	cMsgs := make([]C.LIN_EX_MSG, linExSlaveGetDataMaxFrames)
+	ret := int(C.toomoss_lin_ex_slave_get_data(
+		DevHandle[DEVIndex],
+		C.uchar(d.channel),
+		&cMsgs[0],
+	))
+	if ret < 0 {
+		return nil, fmt.Errorf("LIN_EX_SlaveGetData failed: ret=%d", ret)
+	}
+
+	count := ret
+	if count > len(cMsgs) {
+		count = len(cMsgs)
+	}
+	linMsgs := make([]LinExMsg, count)
+	for i := 0; i < count; i++ {
+		linMsgs[i] = cToGoLINMsg(cMsgs[i])
+	}
+	return linMsgs, nil
 }
