@@ -62,7 +62,7 @@ func testMultiFrameAssembly(t *testing.T, dataSize int) {
 	}
 
 	// 将第一帧推入队列
-	driver.eventQueue <- ffEvent
+	driver.eventQueue(0) <- ffEvent
 	t.Logf("Injected First Frame (FF).")
 
 	// b) 循环构建并注入所有连续帧 (Consecutive Frames - CF)
@@ -90,7 +90,7 @@ func testMultiFrameAssembly(t *testing.T, dataSize int) {
 			Direction:    liniface.RX,
 		}
 		// 将连续帧推入队列
-		driver.eventQueue <- cfEvent
+		driver.eventQueue(0) <- cfEvent
 
 		bytesSent = chunkEnd
 	}

@@ -47,6 +47,7 @@ func putBuffer(buf *[]byte) {
 type Transport struct {
 	isSlave          bool
 	driver           liniface.Driver
+	channel          liniface.Channel
 	txQueue          chan *liniface.LinEvent
 	rxQueue          chan *LinMessage
 	config           TransportConfig
@@ -78,15 +79,20 @@ type LinMessage struct {
 }
 
 // NewTransport creates a new instance of the LIN transport layer with default config.
-func NewTransport(isSlave bool, driver liniface.Driver) *Transport {
-	return NewTransportWithConfig(isSlave, driver, DefaultTransportConfig())
+func NewTransport(isSlave bool, driver liniface.Driver, channel ...liniface.Channel) *Transport {
+	return NewTransportWithConfig(isSlave, driver, DefaultTransportConfig(), channel...)
 }
 
 // NewTransportWithConfig creates a new instance of the LIN transport layer with custom config.
-func NewTransportWithConfig(isSlave bool, driver liniface.Driver, config TransportConfig) *Transport {
+func NewTransportWithConfig(isSlave bool, driver liniface.Driver, config TransportConfig, channel ...liniface.Channel) *Transport {
+	var selectedChannel liniface.Channel
+	if len(channel) > 0 {
+		selectedChannel = channel[0]
+	}
 	return &Transport{
 		isSlave: isSlave,
 		driver:  driver,
+		channel: selectedChannel,
 		txQueue: make(chan *liniface.LinEvent, config.TxQueueSize),
 		rxQueue: make(chan *LinMessage, config.RxQueueSize),
 		config:  config,
@@ -136,7 +142,7 @@ func (t *Transport) execute() error {
 	}
 
 	for {
-		event, err := t.driver.ReadEvent(readTimeout)
+		event, err := t.driver.ReadEvent(readTimeout, t.channel)
 		if err != nil {
 			return fmt.Errorf("failed to read event from driver: %w", err)
 		}
@@ -150,7 +156,7 @@ func (t *Transport) execute() error {
 		if t.scheduledTxEvent == nil {
 			select {
 			case event := <-t.txQueue:
-				if err := t.driver.ScheduleSlaveResponse(event); err != nil {
+				if err := t.driver.ScheduleSlaveResponse(event, t.channel); err != nil {
 					return fmt.Errorf("slave failed to schedule response: %w", err)
 				}
 				t.scheduledTxEvent = event
@@ -161,12 +167,12 @@ func (t *Transport) execute() error {
 	} else { // Master logic
 		select {
 		case event := <-t.txQueue:
-			if err := t.driver.WriteMessage(event); err != nil {
+			if err := t.driver.WriteMessage(event, t.channel); err != nil {
 				return fmt.Errorf("master failed to write message: %w", err)
 			}
 		default:
 			if t.shouldRequestSlaveResponse() {
-				if err := t.driver.RequestSlaveResponse(SlaveDiagnosticFrameID); err != nil {
+				if err := t.driver.RequestSlaveResponse(SlaveDiagnosticFrameID, t.channel); err != nil {
 					return fmt.Errorf("master failed to request slave response: %w", err)
 				}
 			}
@@ -315,7 +321,7 @@ func (t *Transport) receiveFromDriver(event *liniface.LinEvent) {
 			t.scheduledTxEvent = nil
 			select {
 			case nextEvent := <-t.txQueue:
-				if err := t.driver.ScheduleSlaveResponse(nextEvent); err != nil {
+				if err := t.driver.ScheduleSlaveResponse(nextEvent, t.channel); err != nil {
 					log.Printf("slave failed to schedule next response: %v", err)
 				}
 				t.scheduledTxEvent = nextEvent

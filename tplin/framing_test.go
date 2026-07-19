@@ -25,7 +25,7 @@ func NewMockLinDriver() *MockLinDriver {
 	}
 }
 
-func (d *MockLinDriver) ReadEvent(timeout time.Duration) (*liniface.LinEvent, error) {
+func (d *MockLinDriver) ReadEvent(timeout time.Duration, channel liniface.Channel) (*liniface.LinEvent, error) {
 	select {
 	case e := <-d.rxEvents:
 		return e, nil
@@ -34,24 +34,26 @@ func (d *MockLinDriver) ReadEvent(timeout time.Duration) (*liniface.LinEvent, er
 	}
 }
 
-func (d *MockLinDriver) WriteMessage(event *liniface.LinEvent) error {
+func (d *MockLinDriver) WriteMessage(event *liniface.LinEvent, channel liniface.Channel) error {
 	d.txEvents = append(d.txEvents, event)
 	// 将 TX 事件放回队列供 transport 确认
 	txCopy := *event
+	txCopy.Channel = channel
 	txCopy.Direction = liniface.TX
 	d.rxEvents <- &txCopy
 	return nil
 }
 
-func (d *MockLinDriver) ScheduleSlaveResponse(event *liniface.LinEvent) error {
+func (d *MockLinDriver) ScheduleSlaveResponse(event *liniface.LinEvent, channel liniface.Channel) error {
 	d.responses[event.EventID] = event
 	return nil
 }
 
-func (d *MockLinDriver) RequestSlaveResponse(frameID byte) error {
+func (d *MockLinDriver) RequestSlaveResponse(frameID byte, channel liniface.Channel) error {
 	if resp, ok := d.responses[frameID]; ok {
 		delete(d.responses, frameID)
 		rxCopy := *resp
+		rxCopy.Channel = channel
 		rxCopy.Direction = liniface.RX
 		d.rxEvents <- &rxCopy
 	}

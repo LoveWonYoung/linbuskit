@@ -40,9 +40,9 @@ type LinMaster struct {
 
 // NewMaster creates and initializes a new LinMaster instance.
 // It starts the underlying transport layer's background processing.
-func NewMaster(driver liniface.Driver) *LinMaster {
+func NewMaster(driver liniface.Driver, channel ...liniface.Channel) *LinMaster {
 	// a transport layer instance is created for the master
-	transport := NewTransport(false, driver) // isSlave = false
+	transport := NewTransport(false, driver, channel...) // isSlave = false
 	transport.Run()
 
 	return &LinMaster{
@@ -51,8 +51,8 @@ func NewMaster(driver liniface.Driver) *LinMaster {
 }
 
 // NewMasterWithConfig creates a LinMaster with custom transport configuration.
-func NewMasterWithConfig(driver liniface.Driver, config TransportConfig) *LinMaster {
-	transport := NewTransportWithConfig(false, driver, config)
+func NewMasterWithConfig(driver liniface.Driver, config TransportConfig, channel ...liniface.Channel) *LinMaster {
+	transport := NewTransportWithConfig(false, driver, config, channel...)
 	transport.Run()
 	return &LinMaster{transport: transport}
 }

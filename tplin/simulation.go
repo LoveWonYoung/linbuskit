@@ -12,16 +12,21 @@ import (
 // It is responsible for routing messages between the master and slaves.
 // It is safe for concurrent use.
 type SimulatedLinNetwork struct {
-	slaveResponses map[byte]*liniface.LinEvent
+	slaveResponses map[simulatedResponseKey]*liniface.LinEvent
 	masterDriver   *SimulatedLinDriver
 	slaveDrivers   []*SimulatedLinDriver
 	mu             sync.Mutex
 }
 
+type simulatedResponseKey struct {
+	channel liniface.Channel
+	frameID byte
+}
+
 // NewSimulatedLinNetwork creates a new simulation network instance.
 func NewSimulatedLinNetwork() *SimulatedLinNetwork {
 	return &SimulatedLinNetwork{
-		slaveResponses: make(map[byte]*liniface.LinEvent),
+		slaveResponses: make(map[simulatedResponseKey]*liniface.LinEvent),
 	}
 }
 
@@ -31,6 +36,7 @@ func deepCopyEvent(original *liniface.LinEvent) *liniface.LinEvent {
 		return nil
 	}
 	cpy := &liniface.LinEvent{
+		Channel:      original.Channel,
 		EventID:      original.EventID,
 		ChecksumType: original.ChecksumType,
 		Direction:    original.Direction,
@@ -66,14 +72,15 @@ func (n *SimulatedLinNetwork) writeMessage(linEvent *liniface.LinEvent) {
 	}
 }
 
-func (n *SimulatedLinNetwork) requestSlaveResponse(messageID byte) {
+func (n *SimulatedLinNetwork) requestSlaveResponse(messageID byte, channel liniface.Channel) {
 	n.mu.Lock()
-	result, ok := n.slaveResponses[messageID]
+	key := simulatedResponseKey{channel: channel, frameID: messageID}
+	result, ok := n.slaveResponses[key]
 	if !ok {
 		n.mu.Unlock()
 		return // No scheduled response, master will time out
 	}
-	delete(n.slaveResponses, messageID)
+	delete(n.slaveResponses, key)
 	n.mu.Unlock()
 
 	eventTime := time.Now()
@@ -98,7 +105,8 @@ func (n *SimulatedLinNetwork) requestSlaveResponse(messageID byte) {
 func (n *SimulatedLinNetwork) scheduleSlaveResponse(linEvent *liniface.LinEvent) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.slaveResponses[linEvent.EventID] = linEvent
+	key := simulatedResponseKey{channel: linEvent.Channel, frameID: linEvent.EventID}
+	n.slaveResponses[key] = linEvent
 }
 
 // --- Driver factory methods ---
@@ -126,22 +134,23 @@ func (n *SimulatedLinNetwork) CreateSlaveDriver() liniface.Driver {
 
 // SimulatedLinDriver implements the Driver interface for simulation purposes.
 type SimulatedLinDriver struct {
-	isSlave    bool
-	network    *SimulatedLinNetwork
-	eventQueue chan *liniface.LinEvent
+	isSlave     bool
+	network     *SimulatedLinNetwork
+	eventMu     sync.Mutex
+	eventQueues map[liniface.Channel]chan *liniface.LinEvent
 }
 
 func newSimulatedLinDriver(network *SimulatedLinNetwork, isSlave bool) *SimulatedLinDriver {
 	return &SimulatedLinDriver{
-		isSlave:    isSlave,
-		network:    network,
-		eventQueue: make(chan *liniface.LinEvent, 20),
+		isSlave:     isSlave,
+		network:     network,
+		eventQueues: make(map[liniface.Channel]chan *liniface.LinEvent),
 	}
 }
 
 func (d *SimulatedLinDriver) pushEvent(event *liniface.LinEvent) {
 	select {
-	case d.eventQueue <- event:
+	case d.eventQueue(event.Channel) <- event:
 	default:
 		log.Println("SimulatedLinDriver: Event queue is full. Discarding event.")
 	}
@@ -149,32 +158,45 @@ func (d *SimulatedLinDriver) pushEvent(event *liniface.LinEvent) {
 
 // --- Implementation of the Driver interface ---
 
-func (d *SimulatedLinDriver) ReadEvent(timeout time.Duration) (*liniface.LinEvent, error) {
+func (d *SimulatedLinDriver) ReadEvent(timeout time.Duration, channel liniface.Channel) (*liniface.LinEvent, error) {
 	select {
-	case event := <-d.eventQueue:
+	case event := <-d.eventQueue(channel):
 		return event, nil
 	case <-time.After(timeout):
 		return nil, nil // Timeout is not an error
 	}
 }
 
-func (d *SimulatedLinDriver) WriteMessage(linEvent *liniface.LinEvent) error {
+func (d *SimulatedLinDriver) WriteMessage(linEvent *liniface.LinEvent, channel liniface.Channel) error {
 	if !d.isSlave {
+		linEvent.Channel = channel
 		d.network.writeMessage(linEvent)
 	}
 	return nil
 }
 
-func (d *SimulatedLinDriver) ScheduleSlaveResponse(linEvent *liniface.LinEvent) error {
+func (d *SimulatedLinDriver) ScheduleSlaveResponse(linEvent *liniface.LinEvent, channel liniface.Channel) error {
 	if d.isSlave {
+		linEvent.Channel = channel
 		d.network.scheduleSlaveResponse(linEvent)
 	}
 	return nil
 }
 
-func (d *SimulatedLinDriver) RequestSlaveResponse(messageID byte) error {
+func (d *SimulatedLinDriver) RequestSlaveResponse(messageID byte, channel liniface.Channel) error {
 	if !d.isSlave {
-		d.network.requestSlaveResponse(messageID)
+		d.network.requestSlaveResponse(messageID, channel)
 	}
 	return nil
+}
+
+func (d *SimulatedLinDriver) eventQueue(channel liniface.Channel) chan *liniface.LinEvent {
+	d.eventMu.Lock()
+	defer d.eventMu.Unlock()
+	eventQueue := d.eventQueues[channel]
+	if eventQueue == nil {
+		eventQueue = make(chan *liniface.LinEvent, 20)
+		d.eventQueues[channel] = eventQueue
+	}
+	return eventQueue
 }

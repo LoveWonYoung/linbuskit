@@ -15,6 +15,8 @@ type ClientConfig struct {
 	TargetNad      byte
 	DefaultTimeout time.Duration
 	MaxRetries     int
+	// Channel selects the LIN channel used by this client.
+	Channel liniface.Channel
 	// ContinuousSlavePoll 透传到 Transport：true 时空闲也持续请求 0x3D。
 	ContinuousSlavePoll bool
 }
@@ -43,7 +45,7 @@ func NewClient(driver liniface.Driver, targetNad byte) *Client {
 func NewClientWithConfig(driver liniface.Driver, config ClientConfig) *Client {
 	tpCfg := tplin.DefaultTransportConfig()
 	tpCfg.ContinuousSlavePoll = config.ContinuousSlavePoll
-	master := tplin.NewMasterWithConfig(driver, tpCfg)
+	master := tplin.NewMasterWithConfig(driver, tpCfg, config.Channel)
 	return &Client{
 		master: master,
 		config: config,

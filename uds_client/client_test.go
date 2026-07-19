@@ -36,7 +36,7 @@ func (d *MockUDSDriver) SetHandler(handler func(sid byte, data []byte) (byte, []
 	d.responseHandler = handler
 }
 
-func (d *MockUDSDriver) ReadEvent(timeout time.Duration) (*liniface.LinEvent, error) {
+func (d *MockUDSDriver) ReadEvent(timeout time.Duration, channel liniface.Channel) (*liniface.LinEvent, error) {
 	select {
 	case e := <-d.rxQueue:
 		return e, nil
@@ -45,7 +45,7 @@ func (d *MockUDSDriver) ReadEvent(timeout time.Duration) (*liniface.LinEvent, er
 	}
 }
 
-func (d *MockUDSDriver) WriteMessage(event *liniface.LinEvent) error {
+func (d *MockUDSDriver) WriteMessage(event *liniface.LinEvent, channel liniface.Channel) error {
 	d.mu.Lock()
 	d.txLog = append(d.txLog, event)
 	handler := d.responseHandler
@@ -53,6 +53,7 @@ func (d *MockUDSDriver) WriteMessage(event *liniface.LinEvent) error {
 
 	// 将 TX 事件放回队列
 	txCopy := *event
+	txCopy.Channel = channel
 	txCopy.Direction = liniface.TX
 	d.rxQueue <- &txCopy
 
@@ -118,11 +119,11 @@ func (d *MockUDSDriver) processRequest(event *liniface.LinEvent, handler func(by
 	}
 }
 
-func (d *MockUDSDriver) ScheduleSlaveResponse(event *liniface.LinEvent) error {
+func (d *MockUDSDriver) ScheduleSlaveResponse(event *liniface.LinEvent, channel liniface.Channel) error {
 	return nil
 }
 
-func (d *MockUDSDriver) RequestSlaveResponse(frameID byte) error {
+func (d *MockUDSDriver) RequestSlaveResponse(frameID byte, channel liniface.Channel) error {
 	return nil
 }
 

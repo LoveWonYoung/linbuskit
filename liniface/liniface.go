@@ -5,6 +5,7 @@ import "time"
 type Direction int
 type ChecksumType int
 type PCIType byte
+type Channel byte
 
 const (
 	ClassicChecksum  ChecksumType = iota // Up to LIN 1.3
@@ -24,6 +25,7 @@ const (
 
 // LinEvent represents a raw, low-level LIN frame/event.
 type LinEvent struct {
+	Channel      Channel
 	EventID      byte
 	EventPayload []byte
 	ChecksumType ChecksumType
@@ -33,8 +35,8 @@ type LinEvent struct {
 
 // Driver abstracts the underlying LIN hardware or simulation.
 type Driver interface {
-	ReadEvent(timeout time.Duration) (*LinEvent, error)
-	WriteMessage(event *LinEvent) error
-	ScheduleSlaveResponse(event *LinEvent) error
-	RequestSlaveResponse(frameID byte) error
+	ReadEvent(timeout time.Duration, channel Channel) (*LinEvent, error)
+	WriteMessage(event *LinEvent, channel Channel) error
+	ScheduleSlaveResponse(event *LinEvent, channel Channel) error
+	RequestSlaveResponse(frameID byte, channel Channel) error
 }

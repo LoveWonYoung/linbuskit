@@ -124,10 +124,11 @@ type TSMaster struct {
 	mu        sync.Mutex
 	closeOnce sync.Once
 
-	loader    *tsmasterLoader
-	channels  []uint32
-	eventChan chan *liniface.LinEvent
-	errCh     chan error
+	loader     *tsmasterLoader
+	channels   []uint32
+	eventMu    sync.Mutex
+	eventChans map[liniface.Channel]chan *liniface.LinEvent
+	errCh      chan error
 
 	transmitProc *syscall.LazyProc
 	receiveProc  *syscall.LazyProc
@@ -147,11 +148,18 @@ const (
 
 var _ liniface.Driver = (*TSMaster)(nil)
 
-func NewTSMaster(deviceType TSMasterDeviceType) (*TSMaster, error) {
+func NewTSMaster(deviceType TSMasterDeviceType, channels ...liniface.Channel) (*TSMaster, error) {
 	ctx, cancel := context.WithCancel(context.Background())
+	configuredChannels := append([]uint32(nil), defaultTSMasterChannels...)
+	if len(channels) > 0 {
+		configuredChannels = make([]uint32, len(channels))
+		for i, channel := range channels {
+			configuredChannels[i] = uint32(channel)
+		}
+	}
 	t := &TSMaster{
-		channels:   append([]uint32(nil), defaultTSMasterChannels...),
-		eventChan:  make(chan *liniface.LinEvent, 128),
+		channels:   configuredChannels,
+		eventChans: make(map[liniface.Channel]chan *liniface.LinEvent),
 		errCh:      make(chan error, 32),
 		ctx:        ctx,
 		cancel:     cancel,
@@ -359,6 +367,7 @@ func (t *TSMaster) receiveLoop() {
 				copy(payload, msg.FData[:dlc])
 
 				evt := &liniface.LinEvent{
+					Channel:      liniface.Channel(msg.FIdxChn),
 					EventID:      msg.FIdentifier,
 					EventPayload: payload,
 					Direction:    liniface.RX,
@@ -372,7 +381,7 @@ func (t *TSMaster) receiveLoop() {
 				}
 
 				select {
-				case t.eventChan <- evt:
+				case t.eventChannel(evt.Channel) <- evt:
 				default:
 				}
 			}
@@ -391,17 +400,18 @@ func checksumTypeFromID(id byte) liniface.ChecksumType {
 	return liniface.EnhancedChecksum
 }
 
-func (t *TSMaster) ReadEvent(timeout time.Duration) (*liniface.LinEvent, error) {
+func (t *TSMaster) ReadEvent(timeout time.Duration, channel liniface.Channel) (*liniface.LinEvent, error) {
 	if t == nil {
 		return nil, errors.New("tsmaster driver is nil")
 	}
-	if t.eventChan == nil {
+	if t.eventChans == nil {
 		return nil, errors.New("tsmaster event channel is nil")
 	}
+	eventChan := t.eventChannel(channel)
 
 	if timeout <= 0 {
 		select {
-		case evt, ok := <-t.eventChan:
+		case evt, ok := <-eventChan:
 			if !ok {
 				return nil, errors.New("tsmaster driver closed")
 			}
@@ -412,7 +422,7 @@ func (t *TSMaster) ReadEvent(timeout time.Duration) (*liniface.LinEvent, error) 
 	}
 
 	select {
-	case evt, ok := <-t.eventChan:
+	case evt, ok := <-eventChan:
 		if !ok {
 			return nil, errors.New("tsmaster driver closed")
 		}
@@ -422,7 +432,7 @@ func (t *TSMaster) ReadEvent(timeout time.Duration) (*liniface.LinEvent, error) 
 	}
 }
 
-func (t *TSMaster) WriteMessage(event *liniface.LinEvent) error {
+func (t *TSMaster) WriteMessage(event *liniface.LinEvent, channel liniface.Channel) error {
 	if t == nil {
 		return errors.New("tsmaster driver is nil")
 	}
@@ -437,7 +447,7 @@ func (t *TSMaster) WriteMessage(event *liniface.LinEvent) error {
 	}
 
 	msg := tsmasterLIN{
-		FIdxChn:     uint8(t.channels[0]),
+		FIdxChn:     uint8(channel),
 		FProperties: linPropertyDirTxMask,
 		FDLC:        uint8(len(event.EventPayload)),
 		FIdentifier: event.EventID,
@@ -451,17 +461,18 @@ func (t *TSMaster) WriteMessage(event *liniface.LinEvent) error {
 	log.Printf("TX LIN: ID=0x%02X, Len=%02d, CS=%02X, Data=% 02X", msg.FIdentifier, msg.FDLC, msg.FChecksum, msg.FData[:msg.FDLC])
 
 	txCopy := *event
+	txCopy.Channel = channel
 	txCopy.Direction = liniface.TX
 	txCopy.Timestamp = time.Now()
 	select {
-	case t.eventChan <- &txCopy:
+	case t.eventChannel(channel) <- &txCopy:
 	default:
 	}
 
 	return nil
 }
 
-func (t *TSMaster) RequestSlaveResponse(frameID byte) error {
+func (t *TSMaster) RequestSlaveResponse(frameID byte, channel liniface.Channel) error {
 	if t == nil {
 		return errors.New("tsmaster driver is nil")
 	}
@@ -470,7 +481,7 @@ func (t *TSMaster) RequestSlaveResponse(frameID byte) error {
 	}
 
 	msg := tsmasterLIN{
-		FIdxChn:     uint8(t.channels[0]),
+		FIdxChn:     uint8(channel),
 		FProperties: 0,
 		FDLC:        8,
 		FIdentifier: frameID,
@@ -484,11 +495,22 @@ func (t *TSMaster) RequestSlaveResponse(frameID byte) error {
 	return nil
 }
 
-func (t *TSMaster) ScheduleSlaveResponse(event *liniface.LinEvent) error {
+func (t *TSMaster) ScheduleSlaveResponse(event *liniface.LinEvent, channel liniface.Channel) error {
 	if t == nil {
 		return errors.New("tsmaster driver is nil")
 	}
 	return errors.New("tsmaster: ScheduleSlaveResponse is not supported in master mode")
+}
+
+func (t *TSMaster) eventChannel(channel liniface.Channel) chan *liniface.LinEvent {
+	t.eventMu.Lock()
+	defer t.eventMu.Unlock()
+	eventChan := t.eventChans[channel]
+	if eventChan == nil {
+		eventChan = make(chan *liniface.LinEvent, 128)
+		t.eventChans[channel] = eventChan
+	}
+	return eventChan
 }
 
 func (t *TSMaster) Close() error {
@@ -521,7 +543,11 @@ func (t *TSMaster) Close() error {
 			loader.close()
 		}
 
-		close(t.eventChan)
+		t.eventMu.Lock()
+		for _, eventChan := range t.eventChans {
+			close(eventChan)
+		}
+		t.eventMu.Unlock()
 		close(t.errCh)
 	})
 

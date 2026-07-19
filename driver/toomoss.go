@@ -75,7 +75,7 @@ type LinExMsg struct {
 	BreakBits uint8
 	Reserve1  uint8
 }
-type ToomossCh byte
+type ToomossCh = liniface.Channel
 
 const (
 	CH1 ToomossCh = iota
@@ -91,8 +91,8 @@ var (
 )
 
 type Toomoss struct {
-	eventChan chan *liniface.LinEvent
-	channel   ToomossCh
+	eventMu    sync.Mutex
+	eventChans map[liniface.Channel]chan *liniface.LinEvent
 }
 
 func toomossReady() bool {
@@ -474,7 +474,10 @@ func ensureLinReady() error {
 	return nil
 }
 
-func NewToomoss(channel ToomossCh, mode byte) (*Toomoss, error) {
+func NewToomoss(channel []ToomossCh, mode byte) (*Toomoss, error) {
+	if len(channel) == 0 {
+		return nil, errors.New("at least one LIN channel is required")
+	}
 	if err := ensureLinReady(); err != nil {
 		return nil, err
 	}
@@ -484,20 +487,19 @@ func NewToomoss(channel ToomossCh, mode byte) (*Toomoss, error) {
 	if ok := UsbOpen(); !ok {
 		return nil, fmt.Errorf("USB open failed")
 	}
-
-	if tmsInit, ret, err := syscall.SyscallN(LinExInit, uintptr(DevHandle[DEVIndex]), uintptr(channel), uintptr(Bt), uintptr(mode)); tmsInit != 0 {
-		return nil, fmt.Errorf("failed to initialize Toomoss LIN device: ret=%d, err=%v", ret, err)
+	for _, ch := range channel {
+		if tmsInit, ret, err := syscall.SyscallN(LinExInit, uintptr(DevHandle[DEVIndex]), uintptr(ch), uintptr(Bt), uintptr(mode)); tmsInit != 0 {
+			return nil, fmt.Errorf("failed to initialize Toomoss LIN device: ret=%d, err=%v", ret, err)
+		}
 	}
-
 	log.Println("Toomoss LIN device initialized successfully.")
 
 	return &Toomoss{
-		eventChan: make(chan *liniface.LinEvent, 10),
-		channel:   channel,
+		eventChans: make(map[liniface.Channel]chan *liniface.LinEvent),
 	}, nil
 }
 
-func (d *Toomoss) LinMasterSync(msg, outMsg []LinExMsg) (uintptr, error) {
+func (d *Toomoss) LinMasterSync(msg, outMsg []LinExMsg, channel ToomossCh) (uintptr, error) {
 	if len(outMsg) == 0 || len(msg) == 0 {
 		return 0, fmt.Errorf("LinMasterSync called with empty outMsg")
 	}
@@ -507,7 +509,7 @@ func (d *Toomoss) LinMasterSync(msg, outMsg []LinExMsg) (uintptr, error) {
 	ret, _, err := syscall.SyscallN(
 		LinExMasterSync,
 		uintptr(DevHandle[DEVIndex]),
-		uintptr(d.channel),
+		uintptr(channel),
 		uintptr(unsafe.Pointer(&msg[0])),
 		uintptr(unsafe.Pointer(&outMsg[0])),
 		uintptr(len(msg)),
@@ -515,16 +517,17 @@ func (d *Toomoss) LinMasterSync(msg, outMsg []LinExMsg) (uintptr, error) {
 	return ret, err
 }
 
-func (d *Toomoss) ReadEvent(timeout time.Duration) (*liniface.LinEvent, error) {
+func (d *Toomoss) ReadEvent(timeout time.Duration, channel liniface.Channel) (*liniface.LinEvent, error) {
+	eventChan := d.eventChannel(channel)
 	select {
-	case event := <-d.eventChan:
+	case event := <-eventChan:
 		return event, nil
 	case <-time.After(timeout):
 		return nil, nil
 	}
 }
 
-func (d *Toomoss) WriteMessage(event *liniface.LinEvent) error {
+func (d *Toomoss) WriteMessage(event *liniface.LinEvent, channel liniface.Channel) error {
 	msg := make([]LinExMsg, 1)
 	outMsg := make([]LinExMsg, 1)
 	var payload [8]byte
@@ -540,22 +543,23 @@ func (d *Toomoss) WriteMessage(event *liniface.LinEvent) error {
 		msg[0].CheckType = LIN_EX_CHECK_EXT
 	}
 
-	ret, _, err := syscall.SyscallN(LinExMasterSync, uintptr(DevHandle[DEVIndex]), uintptr(d.channel), uintptr(unsafe.Pointer(&msg[0])), uintptr(unsafe.Pointer(&outMsg[0])), uintptr(1))
+	ret, _, err := syscall.SyscallN(LinExMasterSync, uintptr(DevHandle[DEVIndex]), uintptr(channel), uintptr(unsafe.Pointer(&msg[0])), uintptr(unsafe.Pointer(&outMsg[0])), uintptr(1))
 	if ret <= 0 {
 		return fmt.Errorf("toomoss LIN write failed: ret=%d, err=%v", ret, err)
 	}
 	logLINMessage("TX", event.EventID, outMsg[0].DataLen, outMsg[0].Check, payload[:outMsg[0].DataLen])
 	txEvent := *event
+	txEvent.Channel = channel
 	txEvent.Direction = liniface.TX
 	txEvent.Timestamp = time.Now()
 
 	select {
-	case d.eventChan <- &txEvent:
+	case d.eventChannel(channel) <- &txEvent:
 	default:
 	}
 	return nil
 }
-func (d *Toomoss) MasterWrite(frameID byte, data []byte) error {
+func (d *Toomoss) MasterWrite(frameID byte, data []byte, channel ToomossCh) error {
 	if len(data) > 8 {
 		return fmt.Errorf("toomoss MasterWrite: data length %d exceeds 8", len(data))
 	}
@@ -574,7 +578,7 @@ func (d *Toomoss) MasterWrite(frameID byte, data []byte) error {
 	} else {
 		msg[0].CheckType = LIN_EX_CHECK_EXT
 	}
-	ret, err := d.LinMasterSync(msg, outMsg)
+	ret, err := d.LinMasterSync(msg, outMsg, channel)
 
 	if ret <= 0 {
 		return fmt.Errorf("toomoss LIN write failed: ret=%d, err=%v", ret, err)
@@ -583,12 +587,12 @@ func (d *Toomoss) MasterWrite(frameID byte, data []byte) error {
 	return nil
 }
 
-func (d *Toomoss) MasterRead(frameID byte) ([]byte, error) {
+func (d *Toomoss) MasterRead(frameID byte, channel ToomossCh) ([]byte, error) {
 	msg := make([]LinExMsg, 1)
 	outMsg := make([]LinExMsg, 1)
 	msg[0].MsgType = LIN_EX_MSG_TYPE_MR
 	msg[0].PID = frameID
-	ret, _ := d.LinMasterSync(msg, outMsg)
+	ret, _ := d.LinMasterSync(msg, outMsg, channel)
 
 	if ret <= 0 {
 		return nil, errors.New("no response from slave")
@@ -604,12 +608,12 @@ func (d *Toomoss) MasterRead(frameID byte) ([]byte, error) {
 	return result, nil
 }
 
-func (d *Toomoss) RequestSlaveResponse(frameID byte) error {
+func (d *Toomoss) RequestSlaveResponse(frameID byte, channel liniface.Channel) error {
 	msg := make([]LinExMsg, 1)
 	outMsg := make([]LinExMsg, 1)
 	msg[0].MsgType = LIN_EX_MSG_TYPE_MR
 	msg[0].PID = frameID
-	ret, _ := d.LinMasterSync(msg, outMsg)
+	ret, _ := d.LinMasterSync(msg, outMsg, channel)
 
 	if ret <= 0 {
 		log.Printf("RX : 0x%02X (No response from slave)", frameID)
@@ -630,6 +634,7 @@ func (d *Toomoss) RequestSlaveResponse(frameID byte) error {
 	}
 
 	rxEvent := &liniface.LinEvent{
+		Channel:      channel,
 		EventID:      frameID,
 		EventPayload: responseData[:dataLen],
 		Direction:    liniface.RX,
@@ -637,15 +642,26 @@ func (d *Toomoss) RequestSlaveResponse(frameID byte) error {
 	}
 
 	select {
-	case d.eventChan <- rxEvent:
+	case d.eventChannel(channel) <- rxEvent:
 	default:
 		return errors.New("toomoss event channel is full, discarding slave response")
 	}
 	return nil
 }
 
-func (d *Toomoss) ScheduleSlaveResponse(event *liniface.LinEvent) error {
+func (d *Toomoss) ScheduleSlaveResponse(event *liniface.LinEvent, channel liniface.Channel) error {
 	return errors.New("toomoss: ScheduleSlaveResponse is not supported in Master mode")
+}
+
+func (d *Toomoss) eventChannel(channel liniface.Channel) chan *liniface.LinEvent {
+	d.eventMu.Lock()
+	defer d.eventMu.Unlock()
+	eventChan := d.eventChans[channel]
+	if eventChan == nil {
+		eventChan = make(chan *liniface.LinEvent, 10)
+		d.eventChans[channel] = eventChan
+	}
+	return eventChan
 }
 
 // Close releases the USB adapter and loaded driver library.
@@ -653,12 +669,12 @@ func (d *Toomoss) Close() error {
 	return usbClose()
 }
 
-func (d *Toomoss) LinBreak() error {
+func (d *Toomoss) LinBreak(channel ToomossCh) error {
 	msg := make([]LinExMsg, 1)
 	outMsg := make([]LinExMsg, 1)
 	msg[0].MsgType = LIN_EX_MSG_TYPE_BK
 	msg[0].Timestamp = 20
-	if ret, _ := d.LinMasterSync(msg, outMsg); ret <= 0 {
+	if ret, _ := d.LinMasterSync(msg, outMsg, channel); ret <= 0 {
 		return errors.New("LIN break failed")
 	}
 	return nil
@@ -666,7 +682,7 @@ func (d *Toomoss) LinBreak() error {
 
 const linExSlaveGetDataMaxFrames = 512
 
-func (d *Toomoss) LinExSlaveGetData() ([]LinExMsg, error) {
+func (d *Toomoss) LinExSlaveGetData(channel ToomossCh) ([]LinExMsg, error) {
 	if LinEXSlaveGetData == 0 {
 		return nil, errors.New("LIN_EX_SlaveGetData not loaded")
 	}
@@ -675,7 +691,7 @@ func (d *Toomoss) LinExSlaveGetData() ([]LinExMsg, error) {
 	ret, _, callErr := syscall.SyscallN(
 		LinEXSlaveGetData,
 		uintptr(DevHandle[DEVIndex]),
-		uintptr(d.channel),
+		uintptr(channel),
 		uintptr(unsafe.Pointer(&linMsgs[0])),
 	)
 	if callErr != 0 {

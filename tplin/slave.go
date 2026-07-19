@@ -30,12 +30,12 @@ type LinSlave struct {
 }
 
 // NewSlave creates and initializes a new LinSlave instance.
-func NewSlave(nad, variantID byte, supplierID, functionID uint16, serialNumber []byte, driver liniface.Driver) *LinSlave {
+func NewSlave(nad, variantID byte, supplierID, functionID uint16, serialNumber []byte, driver liniface.Driver, channel ...liniface.Channel) *LinSlave {
 	if serialNumber == nil {
 		serialNumber = []byte{0x01, 0x02, 0x03, 0x04}
 	}
 	// A transport layer instance is created for the slave
-	transport := NewTransport(true, driver) // isSlave = true
+	transport := NewTransport(true, driver, channel...) // isSlave = true
 
 	return &LinSlave{
 		nad:              nad,

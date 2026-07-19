@@ -136,14 +136,16 @@ func main() {
 
 ```go
 type Driver interface {
-	ReadEvent(timeout time.Duration) (*LinEvent, error)
-	WriteMessage(event *LinEvent) error
-	ScheduleSlaveResponse(event *LinEvent) error
-	RequestSlaveResponse(frameID byte) error
+	ReadEvent(timeout time.Duration, channel Channel) (*LinEvent, error)
+	WriteMessage(event *LinEvent, channel Channel) error
+	ScheduleSlaveResponse(event *LinEvent, channel Channel) error
+	RequestSlaveResponse(frameID byte, channel Channel) error
 }
 ```
 
 只要实现这组接口，就可以把任意 LIN 适配器接入 `tplin` 和 `uds_client`。
+
+`tplin.NewMaster(driver, channel)`、`tplin.NewSlave(..., driver, channel)` 可将实例绑定到指定通道；省略 `channel` 时使用通道 `0`。`uds_client.ClientConfig.Channel` 提供同样的选择能力。
 
 ### `tplin`
 
