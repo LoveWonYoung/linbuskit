@@ -81,6 +81,9 @@ func (d *MockDriver) ClearTxLog() {
 func (d *MockDriver) Close() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.closed {
+		return
+	}
 	d.closed = true
 	for _, rxQueue := range d.rxQueues {
 		close(rxQueue)
@@ -91,6 +94,10 @@ func (d *MockDriver) Close() {
 
 func (d *MockDriver) ReadEvent(timeout time.Duration, channel liniface.Channel) (*liniface.LinEvent, error) {
 	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+		return nil, liniface.ErrDriverClosed
+	}
 	rxQueue := d.rxQueue(channel)
 	d.mu.Unlock()
 	select {

@@ -29,7 +29,9 @@ const (
 	BroadcastFunctionID = 0xFFFF
 
 	// DefaultTxQueueSize Default configuration values
-	DefaultTxQueueSize       = 10
+	// DefaultTxQueueSize can hold the maximum 4095-byte LIN transport message
+	// (one first frame plus up to 682 consecutive frames) atomically.
+	DefaultTxQueueSize       = 683
 	DefaultRxQueueSize       = 10
 	DefaultPollInterval      = 10 * time.Millisecond
 	DefaultReadTimeout       = 10 * time.Millisecond

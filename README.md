@@ -112,17 +112,18 @@ func main() {
 	client := uds_client.NewClient(masterDriver, 0x01)
 	defer client.Close()
 
-	resp, err := client.SendAndRec([]byte{0xB2, 0x00, 0x34, 0x12, 0x78, 0x56}, 2*time.Second)
+	responseNAD, resp, err := client.SendAndRec([]byte{0xB2, 0x00, 0x34, 0x12, 0x78, 0x56}, 2*time.Second)
 	if err != nil {
 		panic(err)
 	}
 
-	fmt.Printf("response: % X\n", resp)
+	fmt.Printf("response NAD=0x%02X: % X\n", responseNAD, resp)
 }
 ```
 
 说明：
 
+- 第一个返回值是实际响应节点的 NAD，广播请求或同一通道存在多个节点时可据此识别响应来源
 - `payload[0]` 是 SID
 - `payload[1:]` 是服务数据
 - 返回结果包含完整响应字节流，即 `响应 SID + 响应数据`
@@ -194,26 +195,32 @@ import (
 )
 
 func main() {
-	dev, err := driver.NewToomoss()
+	dev, err := driver.NewToomoss(
+		[]driver.ToomossCh{driver.CH1, driver.CH2},
+		driver.Master,
+	)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	client := uds_client.NewClient(dev, 0x01)
+	config := uds_client.DefaultClientConfig(0x01)
+	config.Channel = driver.CH2
+	client := uds_client.NewClientWithConfig(dev, config)
 	defer client.Close()
 
-	resp, err := client.SendAndRec([]byte{0x22, 0xF1, 0x89}, 2*time.Second)
+	responseNAD, resp, err := client.SendAndRec([]byte{0x22, 0xF1, 0x89}, 2*time.Second)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	log.Printf("resp: % X", resp)
+	log.Printf("response NAD=0x%02X: % X", responseNAD, resp)
 }
 ```
 
 注意：
 
 - `driver/toomoss.go` 仅在 Windows 下参与编译
+- 同一设备只创建一个 `Toomoss` 实例，并在构造时一次传入所有需要使用的 LIN 通道
 - 代码会尝试从注册表或默认路径加载 `USB2XXX.dll` / `libusb-1.0.dll`
 - 运行前需要确认 Toomoss 驱动和相关 DLL 已正确安装
 

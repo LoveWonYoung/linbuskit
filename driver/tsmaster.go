@@ -122,6 +122,7 @@ type tsmasterLIN struct {
 
 type TSMaster struct {
 	mu        sync.Mutex
+	callMu    sync.Mutex
 	closeOnce sync.Once
 
 	loader     *tsmasterLoader
@@ -333,12 +334,14 @@ func (t *TSMaster) receiveLoop() {
 		hasFrames := false
 		for _, ch := range t.channels {
 			bufferSize := int32(len(linBuffer))
+			t.callMu.Lock()
 			r, _, _ := t.receiveProc.Call(
 				uintptr(unsafe.Pointer(&linBuffer[0])),
 				uintptr(unsafe.Pointer(&bufferSize)),
 				uintptr(ch),
 				uintptr(0),
 			)
+			t.callMu.Unlock()
 			if r != 0 {
 				t.pushError(fmt.Errorf("tsfifo_receive_lin_msgs failed for channel %d: %d", ch, r))
 				continue
@@ -404,8 +407,8 @@ func (t *TSMaster) ReadEvent(timeout time.Duration, channel liniface.Channel) (*
 	if t == nil {
 		return nil, errors.New("tsmaster driver is nil")
 	}
-	if t.eventChans == nil {
-		return nil, errors.New("tsmaster event channel is nil")
+	if err := t.validateChannel(channel); err != nil {
+		return nil, err
 	}
 	eventChan := t.eventChannel(channel)
 
@@ -454,7 +457,13 @@ func (t *TSMaster) WriteMessage(event *liniface.LinEvent, channel liniface.Chann
 	}
 	copy(msg.FData[:], event.EventPayload)
 
+	t.callMu.Lock()
+	if err := t.validateChannel(channel); err != nil {
+		t.callMu.Unlock()
+		return err
+	}
 	r, _, _ := t.transmitProc.Call(uintptr(unsafe.Pointer(&msg)))
+	t.callMu.Unlock()
 	if r != 0 {
 		return fmt.Errorf("tsapp_transmit_lin_async failed: %d", r)
 	}
@@ -487,7 +496,13 @@ func (t *TSMaster) RequestSlaveResponse(frameID byte, channel liniface.Channel) 
 		FIdentifier: frameID,
 	}
 
+	t.callMu.Lock()
+	if err := t.validateChannel(channel); err != nil {
+		t.callMu.Unlock()
+		return err
+	}
 	r, _, _ := t.transmitProc.Call(uintptr(unsafe.Pointer(&msg)))
+	t.callMu.Unlock()
 	if r != 0 {
 		return fmt.Errorf("tsapp_transmit_lin_async failed: %d", r)
 	}
@@ -513,6 +528,23 @@ func (t *TSMaster) eventChannel(channel liniface.Channel) chan *liniface.LinEven
 	return eventChan
 }
 
+func (t *TSMaster) validateChannel(channel liniface.Channel) error {
+	if t == nil {
+		return liniface.ErrDriverClosed
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.connected {
+		return liniface.ErrDriverClosed
+	}
+	for _, configured := range t.channels {
+		if configured == uint32(channel) {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %d", liniface.ErrInvalidChannel, channel)
+}
+
 func (t *TSMaster) Close() error {
 	if t == nil {
 		return nil
@@ -530,6 +562,8 @@ func (t *TSMaster) Close() error {
 			cancel()
 		}
 		t.wg.Wait()
+		t.callMu.Lock()
+		defer t.callMu.Unlock()
 
 		if loader != nil && connected {
 			if p := loader.proc("tsfifo_disable_receive_fifo"); p != nil {
@@ -563,7 +597,7 @@ func (t *TSMaster) pushError(err error) {
 	default:
 	}
 }
-func (t *TSMaster) LinBreak() error {
+func (t *TSMaster) LinBreak(channels ...liniface.Channel) error {
 	if t == nil {
 		return errors.New("tsmaster driver is nil")
 	}
@@ -574,14 +608,24 @@ func (t *TSMaster) LinBreak() error {
 		return errors.New("tsmaster has no configured channel")
 	}
 
+	channel := liniface.Channel(t.channels[0])
+	if len(channels) > 0 {
+		channel = channels[0]
+	}
 	// FProperties bit1=1: send break, bit0=1: TX direction.
 	msg := tsmasterLIN{
-		FIdxChn:     uint8(t.channels[0]),
+		FIdxChn:     uint8(channel),
 		FProperties: linPropertyDirTxMask | linPropertyBreakMask,
 		FDLC:        0,
 	}
 
+	t.callMu.Lock()
+	if err := t.validateChannel(channel); err != nil {
+		t.callMu.Unlock()
+		return err
+	}
 	r, _, _ := t.transmitProc.Call(uintptr(unsafe.Pointer(&msg)))
+	t.callMu.Unlock()
 	if r != 0 {
 		return fmt.Errorf("tsapp_transmit_lin_async (LIN break) failed: %d", r)
 	}

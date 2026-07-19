@@ -1,6 +1,14 @@
 package liniface
 
-import "time"
+import (
+	"errors"
+	"time"
+)
+
+var (
+	ErrDriverClosed   = errors.New("LIN driver is closed")
+	ErrInvalidChannel = errors.New("LIN channel is not initialized")
+)
 
 type Direction int
 type ChecksumType int

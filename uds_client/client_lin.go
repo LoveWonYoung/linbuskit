@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/LoveWonYoung/linbuskit/liniface"
 	"github.com/LoveWonYoung/linbuskit/tplin"
 )
+
+var ErrResponseTimeout = errors.New("waiting for UDS response timed out")
 
 // ClientConfig holds configuration options for the UDS client.
 type ClientConfig struct {
@@ -32,8 +35,9 @@ func DefaultClientConfig(targetNad byte) ClientConfig {
 
 // Client 是一个高阶 UDS 客户端，用于与单个 LIN 从节点（ECU）进行诊断通信。
 type Client struct {
-	master *tplin.LinMaster
-	config ClientConfig
+	master    *tplin.LinMaster
+	config    ClientConfig
+	requestMu sync.Mutex
 }
 
 // NewClient 创建一个新的 UDS 客户端实例。
@@ -57,33 +61,55 @@ func (c *Client) Close() {
 	c.master.Close()
 }
 
-// SendAndRec 是最常用的接口，使用默认 NAD 发送并等待响应。
-func (c *Client) SendAndRec(payload []byte, timeout time.Duration) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+// SendAndRec 使用默认 NAD 发送并等待响应，返回实际响应节点的 NAD。
+// timeout <= 0 时使用 DefaultTimeout；仅超时错误会按 MaxRetries 重试。
+func (c *Client) SendAndRec(payload []byte, timeout time.Duration) (byte, []byte, error) {
+	return c.sendAndRecWithRetries(c.config.TargetNad, payload, timeout)
+}
+
+// SendAndRecWithContext 支持外部 Context，使用默认 NAD，且不自动重试。
+func (c *Client) SendAndRecWithContext(ctx context.Context, payload []byte) (byte, []byte, error) {
+	c.requestMu.Lock()
+	defer c.requestMu.Unlock()
 	return c.sendAndRec(ctx, c.config.TargetNad, payload)
 }
 
-// SendAndRecWithContext 支持外部传入 Context，仍使用默认 NAD。
-func (c *Client) SendAndRecWithContext(ctx context.Context, payload []byte) ([]byte, error) {
-	return c.sendAndRec(ctx, c.config.TargetNad, payload)
+// SendAndRecWithNAD 临时指定请求 NAD，并返回实际响应节点的 NAD。
+func (c *Client) SendAndRecWithNAD(nad byte, payload []byte, timeout time.Duration) (byte, []byte, error) {
+	return c.sendAndRecWithRetries(nad, payload, timeout)
 }
 
-// SendAndRecWithNAD 允许调用时临时指定 NAD，而无需重新创建 Client。
-func (c *Client) SendAndRecWithNAD(nad byte, payload []byte, timeout time.Duration) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	return c.sendAndRec(ctx, nad, payload)
+func (c *Client) sendAndRecWithRetries(nad byte, payload []byte, timeout time.Duration) (byte, []byte, error) {
+	c.requestMu.Lock()
+	defer c.requestMu.Unlock()
+	if timeout <= 0 {
+		timeout = c.config.DefaultTimeout
+	}
+	attempts := c.config.MaxRetries + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		responseNAD, response, err := c.sendAndRec(ctx, nad, payload)
+		cancel()
+		if err == nil || !errors.Is(err, ErrResponseTimeout) {
+			return responseNAD, response, err
+		}
+		lastErr = err
+	}
+	return 0, nil, lastErr
 }
 
 // sendAndRec 核心实现，支持自定义 NAD 与外部 Context。
-func (c *Client) sendAndRec(ctx context.Context, nad byte, payload []byte) ([]byte, error) {
+func (c *Client) sendAndRec(ctx context.Context, nad byte, payload []byte) (byte, []byte, error) {
 	if len(payload) == 0 {
-		return nil, fmt.Errorf("UDS请求负载不能为空")
+		return 0, nil, fmt.Errorf("UDS请求负载不能为空")
 	}
 
 	// 1. 在发送前，清空接收队列中可能存在的残留消息。
-	for i := 0; i < 10; i++ {
+	for {
 		if c.master.ReceiveDiagnostic() == nil {
 			break
 		}
@@ -92,7 +118,9 @@ func (c *Client) sendAndRec(ctx context.Context, nad byte, payload []byte) ([]by
 	// 2. 发送诊断请求（首字节为 SID，其余为数据）。
 	sid := payload[0]
 	data := payload[1:]
-	c.master.SendDiagnostic(nad, sid, data)
+	if err := c.master.SendDiagnostic(nad, sid, data); err != nil {
+		return 0, nil, fmt.Errorf("发送UDS请求失败: %w", err)
+	}
 	// 无论成功/失败/超时，结束本次会话后停止空闲 0x3D 轮询（ContinuousSlavePoll=false 时生效）。
 	defer c.master.StopAwaitingSlaveResponse()
 
@@ -104,25 +132,38 @@ func (c *Client) sendAndRec(ctx context.Context, nad byte, payload []byte) ([]by
 		select {
 		case <-ctx.Done():
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return nil, fmt.Errorf("等待UDS响应超时")
+				return 0, nil, ErrResponseTimeout
 			}
-			return nil, fmt.Errorf("操作被取消: %w", ctx.Err())
+			return 0, nil, fmt.Errorf("操作被取消: %w", ctx.Err())
+		case err, ok := <-c.master.Errors():
+			if !ok {
+				return 0, nil, tplin.ErrTransportClosed
+			}
+			if err != nil {
+				return 0, nil, fmt.Errorf("LIN传输失败: %w", err)
+			}
 		case <-ticker.C:
 			msg := c.master.ReceiveDiagnostic()
 			if msg == nil {
 				continue
 			}
+			if nad != tplin.BroadcastNAD && msg.NAD != nad {
+				continue
+			}
 			if msg.SID == 0x7F { // Negative Response
-				if len(msg.Data) >= 2 && msg.Data[0] == sid && msg.Data[1] == 0x78 {
+				if len(msg.Data) < 2 || msg.Data[0] != sid {
+					continue
+				}
+				if msg.Data[1] == 0x78 {
 					// Response Pending, 继续等待（仍保持 awaiting，继续读 0x3D）
 					continue
 				}
 				fullNrcResponse := append([]byte{msg.SID}, msg.Data...)
-				return fullNrcResponse, fmt.Errorf("server : %02X 收到负响应 (NRC: 0x%02X - %s)", msg.SID, msg.Data[1], GetNrcString(msg.Data[1]))
+				return msg.NAD, fullNrcResponse, fmt.Errorf("server : %02X 收到负响应 (NRC: 0x%02X - %s)", msg.SID, msg.Data[1], GetNrcString(msg.Data[1]))
 			}
 			if msg.SID == (sid + 0x40) { // Positive Response
 				fullPositiveResponse := append([]byte{msg.SID}, msg.Data...)
-				return fullPositiveResponse, nil
+				return msg.NAD, fullPositiveResponse, nil
 			}
 		}
 	}

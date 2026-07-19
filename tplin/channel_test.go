@@ -13,7 +13,9 @@ func TestTransportUsesConfiguredChannel(t *testing.T) {
 	channel := liniface.Channel(2)
 	transport := NewTransport(false, driver, channel)
 
-	transport.Transmit(0x01, 0x22, []byte{0xF1, 0x89})
+	if err := transport.Transmit(0x01, 0x22, []byte{0xF1, 0x89}); err != nil {
+		t.Fatal(err)
+	}
 	if err := transport.execute(); err != nil {
 		t.Fatalf("execute transport: %v", err)
 	}

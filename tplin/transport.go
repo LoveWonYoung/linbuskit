@@ -2,6 +2,7 @@ package tplin
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -10,6 +11,15 @@ import (
 
 	"github.com/LoveWonYoung/linbuskit/liniface"
 )
+
+var (
+	ErrTransportClosed = errors.New("transport is closed")
+	ErrTxQueueFull     = errors.New("transport transmit queue is full")
+	ErrRxQueueFull     = errors.New("transport receive queue is full")
+	ErrMessageTooLong  = errors.New("LIN transport message exceeds 4095 bytes")
+)
+
+const maxTransportDataLength = 4094 // 12-bit length includes SID.
 
 // DefaultTransportConfig returns a configuration with sensible defaults.
 func DefaultTransportConfig() TransportConfig {
@@ -67,8 +77,15 @@ type Transport struct {
 	multiFrameStartTime time.Time // 多帧接收开始时间
 
 	// Goroutine lifecycle
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	lifecycleMu sync.Mutex
+	running     bool
+	closed      bool
+	cancel      context.CancelFunc
+	done        chan struct{}
+	wake        chan struct{}
+	errors      chan error
+	wg          sync.WaitGroup
+	txMu        sync.Mutex
 }
 
 // LinMessage represents a fully decoded, high-level diagnostic message.
@@ -85,6 +102,7 @@ func NewTransport(isSlave bool, driver liniface.Driver, channel ...liniface.Chan
 
 // NewTransportWithConfig creates a new instance of the LIN transport layer with custom config.
 func NewTransportWithConfig(isSlave bool, driver liniface.Driver, config TransportConfig, channel ...liniface.Channel) *Transport {
+	config = normalizeTransportConfig(config)
 	var selectedChannel liniface.Channel
 	if len(channel) > 0 {
 		selectedChannel = channel[0]
@@ -96,14 +114,44 @@ func NewTransportWithConfig(isSlave bool, driver liniface.Driver, config Transpo
 		txQueue: make(chan *liniface.LinEvent, config.TxQueueSize),
 		rxQueue: make(chan *LinMessage, config.RxQueueSize),
 		config:  config,
+		done:    make(chan struct{}),
+		wake:    make(chan struct{}, 1),
+		errors:  make(chan error, 16),
 	}
+}
+
+func normalizeTransportConfig(config TransportConfig) TransportConfig {
+	defaults := DefaultTransportConfig()
+	if config.TxQueueSize <= 0 {
+		config.TxQueueSize = defaults.TxQueueSize
+	}
+	if config.RxQueueSize <= 0 {
+		config.RxQueueSize = defaults.RxQueueSize
+	}
+	if config.PollInterval <= 0 {
+		config.PollInterval = defaults.PollInterval
+	}
+	if config.ReadTimeout < 0 {
+		config.ReadTimeout = defaults.ReadTimeout
+	}
+	if config.MultiFrameTimeout <= 0 {
+		config.MultiFrameTimeout = defaults.MultiFrameTimeout
+	}
+	return config
 }
 
 // Run starts the transport layer's background processing goroutine.
 func (t *Transport) Run() {
+	t.lifecycleMu.Lock()
+	if t.running || t.closed {
+		t.lifecycleMu.Unlock()
+		return
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.cancel = cancel
+	t.running = true
 	t.wg.Add(1)
+	t.lifecycleMu.Unlock()
 
 	go func() {
 		defer t.wg.Done()
@@ -114,9 +162,13 @@ func (t *Transport) Run() {
 			select {
 			case <-ctx.Done():
 				return
+			case <-t.wake:
+				if err := t.execute(); err != nil {
+					t.reportError(err)
+				}
 			case <-ticker.C:
 				if err := t.execute(); err != nil {
-					log.Printf("Error in transport execution cycle: %v", err)
+					t.reportError(err)
 				}
 			}
 		}
@@ -125,14 +177,46 @@ func (t *Transport) Run() {
 
 // Close gracefully stops the background goroutine.
 func (t *Transport) Close() {
-	if t.cancel != nil {
-		t.cancel()
+	t.lifecycleMu.Lock()
+	if t.closed {
+		done := t.done
+		t.lifecycleMu.Unlock()
+		<-done
+		return
+	}
+	t.closed = true
+	cancel := t.cancel
+	t.lifecycleMu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 	t.wg.Wait()
+	close(t.errors)
+	close(t.done)
+}
+
+// Errors reports asynchronous transport failures.
+func (t *Transport) Errors() <-chan error { return t.errors }
+
+func (t *Transport) reportError(err error) {
+	if err == nil {
+		return
+	}
+	select {
+	case t.errors <- err:
+	default:
+		log.Printf("transport error channel full: %v", err)
+	}
 }
 
 // execute is the main processing loop called periodically by the background goroutine.
 func (t *Transport) execute() error {
+	t.lifecycleMu.Lock()
+	closed := t.closed
+	t.lifecycleMu.Unlock()
+	if closed {
+		return ErrTransportClosed
+	}
 	t.checkMultiFrameTimeout()
 
 	readTimeout := t.config.ReadTimeout
@@ -250,16 +334,48 @@ func (t *Transport) resetState() {
 	t.multiFrameStartTime = time.Time{} // 清除超时跟踪
 }
 
-// Transmit takes high-level message data, packages it into one or more
-func (t *Transport) Transmit(nad, sid byte, data []byte) {
+// Transmit packages and atomically queues a high-level LIN transport message.
+func (t *Transport) Transmit(nad, sid byte, data []byte) error {
+	frames, err := t.buildFrames(nad, sid, data)
+	if err != nil {
+		return err
+	}
+
+	t.txMu.Lock()
+	defer t.txMu.Unlock()
+	t.lifecycleMu.Lock()
+	closed := t.closed
+	t.lifecycleMu.Unlock()
+	if closed {
+		return ErrTransportClosed
+	}
+	if len(frames) > cap(t.txQueue)-len(t.txQueue) {
+		return fmt.Errorf("%w: need %d slots, have %d", ErrTxQueueFull, len(frames), cap(t.txQueue)-len(t.txQueue))
+	}
+	for _, frame := range frames {
+		t.txQueue <- frame
+	}
+	if !t.isSlave {
+		t.awaitingSlaveResponse.Store(true)
+	}
+	select {
+	case t.wake <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (t *Transport) buildFrames(nad, sid byte, data []byte) ([]*liniface.LinEvent, error) {
+	if len(data) > maxTransportDataLength {
+		return nil, fmt.Errorf("%w: data length %d", ErrMessageTooLong, len(data))
+	}
 	var eventID byte
 	if t.isSlave {
 		eventID = SlaveDiagnosticFrameID
 	} else {
 		eventID = MasterDiagnosticFrameID
-		// Master 发出诊断请求后，默认进入等待从节点响应状态。
-		t.awaitingSlaveResponse.Store(true)
 	}
+	frames := make([]*liniface.LinEvent, 0, 1+(len(data)+1)/6)
 	dataLen := len(data) + 1
 	if dataLen <= 6 {
 		pci := (byte(liniface.SF) << 4) | byte(dataLen)
@@ -272,7 +388,7 @@ func (t *Transport) Transmit(nad, sid byte, data []byte) {
 		eventPayload := make([]byte, 8)
 		copy(eventPayload, payload)
 		putBuffer(bufPtr)
-		t.txQueue <- &liniface.LinEvent{EventID: eventID, EventPayload: eventPayload, ChecksumType: liniface.ClassicChecksum}
+		frames = append(frames, &liniface.LinEvent{Channel: t.channel, EventID: eventID, EventPayload: eventPayload, ChecksumType: liniface.ClassicChecksum})
 	} else {
 
 		pci := (byte(liniface.FF) << 4) | byte(dataLen>>8&0x0F)
@@ -286,7 +402,7 @@ func (t *Transport) Transmit(nad, sid byte, data []byte) {
 		eventPayloadFF := make([]byte, 8)
 		copy(eventPayloadFF, payloadFF)
 		putBuffer(bufPtrFF)
-		t.txQueue <- &liniface.LinEvent{EventID: eventID, EventPayload: eventPayloadFF, ChecksumType: liniface.ClassicChecksum}
+		frames = append(frames, &liniface.LinEvent{Channel: t.channel, EventID: eventID, EventPayload: eventPayloadFF, ChecksumType: liniface.ClassicChecksum})
 
 		currentByte := 4
 		currentFrame := 0
@@ -307,9 +423,10 @@ func (t *Transport) Transmit(nad, sid byte, data []byte) {
 			eventPayloadCF := make([]byte, 8)
 			copy(eventPayloadCF, payloadCF)
 			putBuffer(bufPtrCF)
-			t.txQueue <- &liniface.LinEvent{EventID: eventID, EventPayload: eventPayloadCF, ChecksumType: liniface.ClassicChecksum}
+			frames = append(frames, &liniface.LinEvent{Channel: t.channel, EventID: eventID, EventPayload: eventPayloadCF, ChecksumType: liniface.ClassicChecksum})
 		}
 	}
+	return frames, nil
 }
 
 // receiveFromDriver processes a raw event from the driver and updates the TP state.
@@ -361,8 +478,8 @@ func (t *Transport) receiveFromDriver(event *liniface.LinEvent) {
 				return
 			}
 			sid := payload[2]
-			data := payload[3 : 3+dataLength]
-			t.rxQueue <- &LinMessage{NAD: nad, SID: sid, Data: data}
+			data := append([]byte(nil), payload[3:3+dataLength]...)
+			t.deliverMessage(&LinMessage{NAD: nad, SID: sid, Data: data})
 
 		case liniface.FF:
 			if t.remainingBytes > 0 {
@@ -374,6 +491,10 @@ func (t *Transport) receiveFromDriver(event *liniface.LinEvent) {
 				return
 			}
 			length := (int(additionalInfo) << 8) | int(payload[2])
+			if length <= 6 || length > maxTransportDataLength+1 {
+				log.Printf("Error: FF with invalid transport length %d", length)
+				return
+			}
 			sid := payload[3]
 			t.remainingBytes = length - 1 - 4
 			t.currentFrameData = make([]byte, 0, 4+t.remainingBytes)
@@ -406,9 +527,17 @@ func (t *Transport) receiveFromDriver(event *liniface.LinEvent) {
 
 			if t.remainingBytes == 0 {
 				msg := &LinMessage{NAD: t.currentNAD, SID: t.currentSID, Data: t.currentFrameData}
-				t.rxQueue <- msg
+				t.deliverMessage(msg)
 				t.resetState()
 			}
 		}
+	}
+}
+
+func (t *Transport) deliverMessage(msg *LinMessage) {
+	select {
+	case t.rxQueue <- msg:
+	default:
+		t.reportError(ErrRxQueueFull)
 	}
 }

@@ -221,11 +221,18 @@ var (
 	DevHandle [10]C.int
 	DEVIndex  = 0
 
-	toomossMu     sync.Mutex
-	toomossLoaded bool
+	toomossMu             sync.Mutex
+	toomossLoaded         bool
+	toomossInstanceMu     sync.Mutex
+	toomossInstanceActive bool
 )
 
 type Toomoss struct {
+	callMu     sync.Mutex
+	stateMu    sync.RWMutex
+	closeOnce  sync.Once
+	closed     bool
+	channels   map[liniface.Channel]struct{}
 	eventMu    sync.Mutex
 	eventChans map[liniface.Channel]chan *liniface.LinEvent
 }
@@ -357,6 +364,11 @@ func cToGoLINMsg(cMsg C.LIN_EX_MSG) LinExMsg {
 }
 
 func NewToomoss(channels []ToomossCh) (*Toomoss, error) {
+	toomossInstanceMu.Lock()
+	defer toomossInstanceMu.Unlock()
+	if toomossInstanceActive {
+		return nil, errors.New("a Toomoss device instance is already active; configure all LIN channels on that instance")
+	}
 	if len(channels) == 0 {
 		return nil, errors.New("at least one LIN channel is required")
 	}
@@ -378,13 +390,20 @@ func NewToomoss(channels []ToomossCh) (*Toomoss, error) {
 			C.uchar(Master),
 		)
 		if ret != 0 {
+			_ = usbClose()
 			return nil, fmt.Errorf("failed to initialize Toomoss LIN channel %d: ret=%d", channel, int(ret))
 		}
 	}
 
 	log.Println("Toomoss LIN device initialized successfully.")
 
+	initializedChannels := make(map[liniface.Channel]struct{}, len(channels))
+	for _, channel := range channels {
+		initializedChannels[channel] = struct{}{}
+	}
+	toomossInstanceActive = true
 	return &Toomoss{
+		channels:   initializedChannels,
 		eventChans: make(map[liniface.Channel]chan *liniface.LinEvent),
 	}, nil
 }
@@ -403,6 +422,11 @@ func (d *Toomoss) LinMasterSync(msg, outMsg []LinExMsg, channel ToomossCh) (uint
 		cIn[i] = goToCLINMsg(msg[i])
 	}
 
+	d.callMu.Lock()
+	defer d.callMu.Unlock()
+	if err := d.validateChannel(channel); err != nil {
+		return 0, err
+	}
 	ret := C.toomoss_lin_ex_master_sync(
 		DevHandle[DEVIndex],
 		C.uchar(channel),
@@ -418,16 +442,65 @@ func (d *Toomoss) LinMasterSync(msg, outMsg []LinExMsg, channel ToomossCh) (uint
 }
 
 func (d *Toomoss) ReadEvent(timeout time.Duration, channel liniface.Channel) (*liniface.LinEvent, error) {
+	if err := d.validateChannel(channel); err != nil {
+		return nil, err
+	}
 	eventChan := d.eventChannel(channel)
-	select {
-	case event := <-eventChan:
-		return event, nil
-	case <-time.After(timeout):
-		return nil, nil
+	deadline := time.Now().Add(timeout)
+	for {
+		select {
+		case event := <-eventChan:
+			return event, nil
+		default:
+		}
+		messages, err := d.LinExSlaveGetData(channel)
+		if err != nil {
+			return nil, err
+		}
+		if len(messages) > 0 {
+			for i := 1; i < len(messages); i++ {
+				select {
+				case eventChan <- toomossEvent(messages[i], channel):
+				default:
+				}
+			}
+			return toomossEvent(messages[0], channel), nil
+		}
+		if timeout <= 0 || !time.Now().Before(deadline) {
+			return nil, nil
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func toomossEvent(message LinExMsg, channel liniface.Channel) *liniface.LinEvent {
+	dataLen := min(int(message.DataLen), len(message.Data))
+	payload := append([]byte(nil), message.Data[:dataLen]...)
+	direction := liniface.RX
+	if message.MsgType == LIN_EX_MSG_TYPE_SW {
+		direction = liniface.TX
+	}
+	checksumType := liniface.EnhancedChecksum
+	if message.CheckType == LIN_EX_CHECK_STD {
+		checksumType = liniface.ClassicChecksum
+	}
+	return &liniface.LinEvent{
+		Channel:      channel,
+		EventID:      message.PID & 0x3F,
+		EventPayload: payload,
+		ChecksumType: checksumType,
+		Direction:    direction,
+		Timestamp:    time.Now(),
 	}
 }
 
 func (d *Toomoss) WriteMessage(event *liniface.LinEvent, channel liniface.Channel) error {
+	if event == nil {
+		return errors.New("nil LIN event")
+	}
+	if len(event.EventPayload) > 8 {
+		return fmt.Errorf("invalid LIN payload length %d (max 8)", len(event.EventPayload))
+	}
 	msg := make([]LinExMsg, 1)
 	outMsg := make([]LinExMsg, 1)
 	var payload [8]byte
@@ -567,7 +640,22 @@ func (d *Toomoss) eventChannel(channel liniface.Channel) chan *liniface.LinEvent
 
 // Close releases the USB adapter and loaded driver library.
 func (d *Toomoss) Close() error {
-	return usbClose()
+	if d == nil {
+		return nil
+	}
+	var closeErr error
+	d.closeOnce.Do(func() {
+		d.stateMu.Lock()
+		d.closed = true
+		d.stateMu.Unlock()
+		d.callMu.Lock()
+		closeErr = usbClose()
+		d.callMu.Unlock()
+		toomossInstanceMu.Lock()
+		toomossInstanceActive = false
+		toomossInstanceMu.Unlock()
+	})
+	return closeErr
 }
 
 func (d *Toomoss) LinBreak(channel ToomossCh) error {
@@ -584,16 +672,25 @@ func (d *Toomoss) LinBreak(channel ToomossCh) error {
 const linExSlaveGetDataMaxFrames = 512
 
 func (d *Toomoss) LinExSlaveGetData(channel ToomossCh) ([]LinExMsg, error) {
+	if err := d.validateChannel(channel); err != nil {
+		return nil, err
+	}
 	if err := ensureToomossLoaded(); err != nil {
 		return nil, err
 	}
 
 	cMsgs := make([]C.LIN_EX_MSG, linExSlaveGetDataMaxFrames)
+	d.callMu.Lock()
+	if err := d.validateChannel(channel); err != nil {
+		d.callMu.Unlock()
+		return nil, err
+	}
 	ret := int(C.toomoss_lin_ex_slave_get_data(
 		DevHandle[DEVIndex],
 		C.uchar(channel),
 		&cMsgs[0],
 	))
+	d.callMu.Unlock()
 	if ret < 0 {
 		return nil, fmt.Errorf("LIN_EX_SlaveGetData failed: ret=%d", ret)
 	}
@@ -607,4 +704,19 @@ func (d *Toomoss) LinExSlaveGetData(channel ToomossCh) ([]LinExMsg, error) {
 		linMsgs[i] = cToGoLINMsg(cMsgs[i])
 	}
 	return linMsgs, nil
+}
+
+func (d *Toomoss) validateChannel(channel liniface.Channel) error {
+	if d == nil {
+		return liniface.ErrDriverClosed
+	}
+	d.stateMu.RLock()
+	defer d.stateMu.RUnlock()
+	if d.closed {
+		return liniface.ErrDriverClosed
+	}
+	if _, ok := d.channels[channel]; !ok {
+		return fmt.Errorf("%w: %d", liniface.ErrInvalidChannel, channel)
+	}
+	return nil
 }

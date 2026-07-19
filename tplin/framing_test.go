@@ -4,6 +4,7 @@ package tplin
 
 import (
 	"bytes"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 
 // MockLinDriver 是一个简单的测试用模拟驱动
 type MockLinDriver struct {
+	mu        sync.Mutex
 	rxEvents  chan *liniface.LinEvent
 	txEvents  []*liniface.LinEvent
 	responses map[byte]*liniface.LinEvent
@@ -35,7 +37,9 @@ func (d *MockLinDriver) ReadEvent(timeout time.Duration, channel liniface.Channe
 }
 
 func (d *MockLinDriver) WriteMessage(event *liniface.LinEvent, channel liniface.Channel) error {
+	d.mu.Lock()
 	d.txEvents = append(d.txEvents, event)
+	d.mu.Unlock()
 	// 将 TX 事件放回队列供 transport 确认
 	txCopy := *event
 	txCopy.Channel = channel
@@ -45,19 +49,31 @@ func (d *MockLinDriver) WriteMessage(event *liniface.LinEvent, channel liniface.
 }
 
 func (d *MockLinDriver) ScheduleSlaveResponse(event *liniface.LinEvent, channel liniface.Channel) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	d.responses[event.EventID] = event
 	return nil
 }
 
 func (d *MockLinDriver) RequestSlaveResponse(frameID byte, channel liniface.Channel) error {
+	d.mu.Lock()
 	if resp, ok := d.responses[frameID]; ok {
 		delete(d.responses, frameID)
+		d.mu.Unlock()
 		rxCopy := *resp
 		rxCopy.Channel = channel
 		rxCopy.Direction = liniface.RX
 		d.rxEvents <- &rxCopy
+		return nil
 	}
+	d.mu.Unlock()
 	return nil
+}
+
+func (d *MockLinDriver) TxEvents() []*liniface.LinEvent {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]*liniface.LinEvent(nil), d.txEvents...)
 }
 
 func (d *MockLinDriver) InjectRxEvent(event *liniface.LinEvent) {
@@ -80,16 +96,19 @@ func TestSingleFrameTransmit(t *testing.T) {
 	sid := byte(0x22)
 	data := []byte{0xF1, 0x89}
 
-	transport.Transmit(nad, sid, data)
+	if err := transport.Transmit(nad, sid, data); err != nil {
+		t.Fatal(err)
+	}
 
 	// 等待发送
 	time.Sleep(50 * time.Millisecond)
 
-	if len(driver.txEvents) == 0 {
+	txEvents := driver.TxEvents()
+	if len(txEvents) == 0 {
 		t.Fatal("没有发送任何帧")
 	}
 
-	frame := driver.txEvents[0]
+	frame := txEvents[0]
 	t.Logf("发送的帧: ID=0x%02X, Payload=% 02X", frame.EventID, frame.EventPayload)
 
 	// 验证帧内容
@@ -134,19 +153,22 @@ func TestMultiFrameTransmit(t *testing.T) {
 		data[i] = byte(i)
 	}
 
-	transport.Transmit(nad, sid, data)
+	if err := transport.Transmit(nad, sid, data); err != nil {
+		t.Fatal(err)
+	}
 
 	// 等待发送
 	time.Sleep(100 * time.Millisecond)
 
-	if len(driver.txEvents) < 2 {
-		t.Fatalf("期望至少2帧，实际发送 %d 帧", len(driver.txEvents))
+	txEvents := driver.TxEvents()
+	if len(txEvents) < 2 {
+		t.Fatalf("期望至少2帧，实际发送 %d 帧", len(txEvents))
 	}
 
-	t.Logf("共发送 %d 帧", len(driver.txEvents))
+	t.Logf("共发送 %d 帧", len(txEvents))
 
 	// 验证第一帧 (FF)
-	ff := driver.txEvents[0]
+	ff := txEvents[0]
 	t.Logf("FF: % 02X", ff.EventPayload)
 
 	pciType := liniface.PCIType(ff.EventPayload[1] >> 4)
@@ -155,8 +177,8 @@ func TestMultiFrameTransmit(t *testing.T) {
 	}
 
 	// 验证后续帧 (CF)
-	for i := 1; i < len(driver.txEvents); i++ {
-		cf := driver.txEvents[i]
+	for i := 1; i < len(txEvents); i++ {
+		cf := txEvents[i]
 		t.Logf("CF %d: % 02X", i, cf.EventPayload)
 
 		pciType := liniface.PCIType(cf.EventPayload[1] >> 4)
@@ -284,8 +306,6 @@ func TestNegativeResponse(t *testing.T) {
 func BenchmarkSingleFrameTransmit(b *testing.B) {
 	driver := NewMockLinDriver()
 	transport := NewTransport(false, driver)
-	transport.Run()
-	defer transport.Close()
 
 	nad := byte(0x7F)
 	sid := byte(0x22)
@@ -293,15 +313,18 @@ func BenchmarkSingleFrameTransmit(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		transport.Transmit(nad, sid, data)
+		if err := transport.Transmit(nad, sid, data); err != nil {
+			b.Fatal(err)
+		}
+		<-transport.txQueue
 	}
 }
 
 func BenchmarkMultiFrameTransmit(b *testing.B) {
 	driver := NewMockLinDriver()
-	transport := NewTransport(false, driver)
-	transport.Run()
-	defer transport.Close()
+	config := DefaultTransportConfig()
+	config.TxQueueSize = 32
+	transport := NewTransportWithConfig(false, driver, config)
 
 	nad := byte(0x7F)
 	sid := byte(0x36)
@@ -309,6 +332,11 @@ func BenchmarkMultiFrameTransmit(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		transport.Transmit(nad, sid, data)
+		if err := transport.Transmit(nad, sid, data); err != nil {
+			b.Fatal(err)
+		}
+		for len(transport.txQueue) > 0 {
+			<-transport.txQueue
+		}
 	}
 }

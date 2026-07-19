@@ -159,9 +159,12 @@ func TestClientReadDataByIdentifier(t *testing.T) {
 	defer client.Close()
 
 	// 测试读取软件版本
-	resp, err := client.SendAndRec([]byte{0x22, 0xF1, 0x89}, 2*time.Second)
+	responseNAD, resp, err := client.SendAndRec([]byte{0x22, 0xF1, 0x89}, 2*time.Second)
 	if err != nil {
 		t.Fatalf("请求失败: %v", err)
+	}
+	if responseNAD != 0x7F {
+		t.Fatalf("响应 NAD = 0x%02X, 期望 0x7F", responseNAD)
 	}
 
 	t.Logf("收到响应: % 02X", resp)
@@ -176,6 +179,61 @@ func TestClientReadDataByIdentifier(t *testing.T) {
 	}
 
 	t.Log("✅ ReadDataByIdentifier 测试通过")
+}
+
+func TestClientIgnoresResponseFromDifferentNAD(t *testing.T) {
+	driver := NewMockUDSDriver()
+	driver.SetHandler(func(sid byte, data []byte) (byte, []byte, error) {
+		return sid + 0x40, []byte{0xAA}, nil
+	})
+	client := NewClient(driver, 0x01)
+	defer client.Close()
+
+	go func() {
+		time.Sleep(time.Millisecond)
+		driver.rxQueue <- &liniface.LinEvent{
+			EventID:      tplin.SlaveDiagnosticFrameID,
+			EventPayload: []byte{0x02, 0x02, 0x62, 0xBB, 0xFF, 0xFF, 0xFF, 0xFF},
+			Direction:    liniface.RX,
+		}
+	}()
+
+	responseNAD, response, err := client.SendAndRec([]byte{0x22}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if responseNAD != 0x01 {
+		t.Fatalf("response NAD = 0x%02X, want 0x01", responseNAD)
+	}
+	if len(response) < 2 || response[1] != 0xAA {
+		t.Fatalf("response = % X", response)
+	}
+}
+
+func TestClientIgnoresMalformedNegativeResponse(t *testing.T) {
+	driver := NewMockUDSDriver()
+	driver.SetHandler(func(sid byte, data []byte) (byte, []byte, error) {
+		return 0, nil, errors.New("reject")
+	})
+	client := NewClient(driver, 0x01)
+	defer client.Close()
+
+	go func() {
+		time.Sleep(time.Millisecond)
+		driver.rxQueue <- &liniface.LinEvent{
+			EventID:      tplin.SlaveDiagnosticFrameID,
+			EventPayload: []byte{0x01, 0x01, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
+			Direction:    liniface.RX,
+		}
+	}()
+
+	responseNAD, response, err := client.SendAndRec([]byte{0x22}, time.Second)
+	if err == nil {
+		t.Fatal("expected negative response error")
+	}
+	if responseNAD != 0x01 || len(response) < 3 || response[0] != 0x7F {
+		t.Fatalf("NAD=0x%02X response=% X err=%v", responseNAD, response, err)
+	}
 }
 
 // TestClientWithContext 测试带 Context 的请求
@@ -195,7 +253,7 @@ func TestClientWithContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	_, err := client.SendAndRecWithContext(ctx, []byte{0x22, 0xF1, 0x89})
+	_, _, err := client.SendAndRecWithContext(ctx, []byte{0x22, 0xF1, 0x89})
 	if err == nil {
 		t.Fatal("期望超时错误，但没有错误")
 	}
@@ -216,7 +274,7 @@ func TestClientNegativeResponse(t *testing.T) {
 	client := NewClient(driver, 0x7F)
 	defer client.Close()
 
-	resp, err := client.SendAndRec([]byte{0x22, 0xFF, 0xFF}, 2*time.Second)
+	_, resp, err := client.SendAndRec([]byte{0x22, 0xFF, 0xFF}, 2*time.Second)
 	if err == nil {
 		t.Fatal("期望错误，但没有错误")
 	}
@@ -250,7 +308,7 @@ func TestClientDiagnosticSession(t *testing.T) {
 	defer client.Close()
 
 	// 切换到扩展诊断会话 (0x03)
-	resp, err := client.SendAndRec([]byte{0x10, 0x03}, 2*time.Second)
+	_, resp, err := client.SendAndRec([]byte{0x10, 0x03}, 2*time.Second)
 	if err != nil {
 		t.Fatalf("请求失败: %v", err)
 	}
@@ -282,6 +340,6 @@ func BenchmarkClientSendAndRec(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = client.SendAndRec(payload, 1*time.Second)
+		_, _, _ = client.SendAndRec(payload, 1*time.Second)
 	}
 }
