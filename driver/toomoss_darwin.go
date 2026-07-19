@@ -42,7 +42,7 @@ static fn_LIN_EX_Init pLIN_EX_Init = NULL;
 static fn_LIN_EX_MasterSync pLIN_EX_MasterSync = NULL;
 static fn_LIN_EX_SlaveGetData pLIN_EX_SlaveGetData = NULL;
 
-void toomoss_unload();
+void lin_toomoss_unload();
 
 static int write_error(char* errbuf, size_t errlen, const char* prefix, const char* detail) {
 	if (errbuf != NULL && errlen > 0) {
@@ -61,12 +61,12 @@ static int write_error(char* errbuf, size_t errlen, const char* prefix, const ch
 		dst = (type)dlsym(g_usb2xxx, name); \
 		const char* sym_err = dlerror(); \
 		if (sym_err != NULL || dst == NULL) { \
-			toomoss_unload(); \
+			lin_toomoss_unload(); \
 			return write_error(errbuf, errlen, name, sym_err); \
 		} \
 	} while (0)
 
-int toomoss_load(const char* libusb_path, const char* usb2xxx_path, char* errbuf, size_t errlen) {
+int lin_toomoss_load(const char* libusb_path, const char* usb2xxx_path, char* errbuf, size_t errlen) {
 	if (g_usb2xxx != NULL) {
 		return 0;
 	}
@@ -97,7 +97,7 @@ int toomoss_load(const char* libusb_path, const char* usb2xxx_path, char* errbuf
 	return 0;
 }
 
-void toomoss_unload() {
+void lin_toomoss_unload() {
 	pUSB_ScanDevice = NULL;
 	pUSB_OpenDevice = NULL;
 	pUSB_CloseDevice = NULL;
@@ -115,32 +115,32 @@ void toomoss_unload() {
 	}
 }
 
-int toomoss_usb_scan_device(int* pDevHandle) {
+int lin_toomoss_usb_scan_device(int* pDevHandle) {
 	if (pUSB_ScanDevice == NULL) return -1;
 	return pUSB_ScanDevice(pDevHandle);
 }
 
-int toomoss_usb_open_device(int DevHandle) {
+int lin_toomoss_usb_open_device(int DevHandle) {
 	if (pUSB_OpenDevice == NULL) return -1;
 	return pUSB_OpenDevice(DevHandle) ? 1 : 0;
 }
 
-int toomoss_usb_close_device(int DevHandle) {
+int lin_toomoss_usb_close_device(int DevHandle) {
 	if (pUSB_CloseDevice == NULL) return -1;
 	return pUSB_CloseDevice(DevHandle) ? 1 : 0;
 }
 
-int toomoss_lin_ex_init(int DevHandle, unsigned char LINIndex, unsigned int BaudRate, unsigned char MasterMode) {
+int lin_toomoss_lin_ex_init(int DevHandle, unsigned char LINIndex, unsigned int BaudRate, unsigned char MasterMode) {
 	if (pLIN_EX_Init == NULL) return -1;
 	return pLIN_EX_Init(DevHandle, LINIndex, BaudRate, MasterMode);
 }
 
-int toomoss_lin_ex_master_sync(int DevHandle, unsigned char LINIndex, LIN_EX_MSG *pInMsg, LIN_EX_MSG *pOutMsg, unsigned int MsgLen) {
+int lin_toomoss_lin_ex_master_sync(int DevHandle, unsigned char LINIndex, LIN_EX_MSG *pInMsg, LIN_EX_MSG *pOutMsg, unsigned int MsgLen) {
 	if (pLIN_EX_MasterSync == NULL) return -1;
 	return pLIN_EX_MasterSync(DevHandle, LINIndex, pInMsg, pOutMsg, MsgLen);
 }
 
-int toomoss_lin_ex_slave_get_data(int DevHandle, unsigned char LINIndex, LIN_EX_MSG *pLINMsg) {
+int lin_toomoss_lin_ex_slave_get_data(int DevHandle, unsigned char LINIndex, LIN_EX_MSG *pLINMsg) {
 	if (pLIN_EX_SlaveGetData == NULL) return -1;
 	return pLIN_EX_SlaveGetData(DevHandle, LINIndex, pLINMsg);
 }
@@ -215,8 +215,9 @@ const (
 )
 
 var (
-	Bt     uint = 19200
-	Master byte = 1
+	Bt        uint = 19200
+	Master    byte = 1
+	SlaveMode byte = 0
 
 	DevHandle [10]C.int
 	DEVIndex  = 0
@@ -257,7 +258,7 @@ func ensureToomossLoaded() error {
 	defer C.free(unsafe.Pointer(usb2xxxPath))
 
 	var errBuf [512]C.char
-	if ret := C.toomoss_load(libusbPath, usb2xxxPath, &errBuf[0], C.size_t(len(errBuf))); ret != 0 {
+	if ret := C.lin_toomoss_load(libusbPath, usb2xxxPath, &errBuf[0], C.size_t(len(errBuf))); ret != 0 {
 		return fmt.Errorf("load Toomoss dylib failed: %s", C.GoString(&errBuf[0]))
 	}
 
@@ -270,7 +271,7 @@ func usbScan() (bool, error) {
 		return false, err
 	}
 
-	ret := int(C.toomoss_usb_scan_device(&DevHandle[DEVIndex]))
+	ret := int(C.lin_toomoss_usb_scan_device(&DevHandle[DEVIndex]))
 	if ret <= 0 {
 		return false, nil
 	}
@@ -291,7 +292,7 @@ func usbOpen() (bool, error) {
 		return false, err
 	}
 
-	stateValue := int(C.toomoss_usb_open_device(DevHandle[DEVIndex]))
+	stateValue := int(C.lin_toomoss_usb_open_device(DevHandle[DEVIndex]))
 	return stateValue >= 1, nil
 }
 
@@ -312,12 +313,12 @@ func usbClose() error {
 		return nil
 	}
 
-	ret := int(C.toomoss_usb_close_device(DevHandle[DEVIndex]))
+	ret := int(C.lin_toomoss_usb_close_device(DevHandle[DEVIndex]))
 	if ret < 1 {
 		return fmt.Errorf("USB_CloseDevice returned %d", ret)
 	}
 
-	C.toomoss_unload()
+	C.lin_toomoss_unload()
 	resetToomossState()
 	return nil
 }
@@ -363,7 +364,7 @@ func cToGoLINMsg(cMsg C.LIN_EX_MSG) LinExMsg {
 	return msg
 }
 
-func NewToomoss(channels []ToomossCh) (*Toomoss, error) {
+func NewToomoss(channels []ToomossCh, mode byte) (*Toomoss, error) {
 	toomossInstanceMu.Lock()
 	defer toomossInstanceMu.Unlock()
 	if toomossInstanceActive {
@@ -383,11 +384,11 @@ func NewToomoss(channels []ToomossCh) (*Toomoss, error) {
 	}
 
 	for _, channel := range channels {
-		ret := C.toomoss_lin_ex_init(
+		ret := C.lin_toomoss_lin_ex_init(
 			DevHandle[DEVIndex],
 			C.uchar(channel),
 			C.uint(Bt),
-			C.uchar(Master),
+			C.uchar(mode),
 		)
 		if ret != 0 {
 			_ = usbClose()
@@ -427,7 +428,7 @@ func (d *Toomoss) LinMasterSync(msg, outMsg []LinExMsg, channel ToomossCh) (uint
 	if err := d.validateChannel(channel); err != nil {
 		return 0, err
 	}
-	ret := C.toomoss_lin_ex_master_sync(
+	ret := C.lin_toomoss_lin_ex_master_sync(
 		DevHandle[DEVIndex],
 		C.uchar(channel),
 		&cIn[0],
@@ -685,7 +686,7 @@ func (d *Toomoss) LinExSlaveGetData(channel ToomossCh) ([]LinExMsg, error) {
 		d.callMu.Unlock()
 		return nil, err
 	}
-	ret := int(C.toomoss_lin_ex_slave_get_data(
+	ret := int(C.lin_toomoss_lin_ex_slave_get_data(
 		DevHandle[DEVIndex],
 		C.uchar(channel),
 		&cMsgs[0],
