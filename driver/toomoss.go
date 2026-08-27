@@ -632,6 +632,7 @@ func (d *Toomoss) WriteMessage(event *liniface.LinEvent, channel liniface.Channe
 	}
 	return nil
 }
+
 func (d *Toomoss) MasterWrite(frameID byte, data []byte, channel ToomossCh) error {
 	if len(data) > 8 {
 		return fmt.Errorf("toomoss MasterWrite: data length %d exceeds 8", len(data))

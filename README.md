@@ -224,6 +224,37 @@ func main() {
 - 代码会尝试从注册表或默认路径加载 `USB2XXX.dll` / `libusb-1.0.dll`
 - 运行前需要确认 Toomoss 驱动和相关 DLL 已正确安装
 
+### Windows: PEAK PCAN / PLIN
+
+`driver.NewPCAN()` 使用 PEAK 的 `PLinApi.dll` 接入 PCAN-USB Pro、PCAN-USB Pro FD 或 PLIN-USB。默认配置为主站、19200 baud、逻辑通道 0：
+
+```go
+driver.SetPrintLog(true) // 打印 PCAN 初始化、收发帧、请求头、从站预置和关闭日志
+
+dev, err := driver.NewPCAN()
+if err != nil {
+	log.Fatal(err)
+}
+defer dev.Close()
+
+config := uds_client.DefaultClientConfig(0x01)
+client := uds_client.NewClientWithConfig(dev, config)
+defer client.Close()
+```
+
+需要从站模式、其它波特率或多个通道时，可使用配置构造函数：
+
+```go
+dev, err := driver.NewPCANWithConfig(driver.PCANConfig{
+	ClientName: "my-lin-client",
+	Mode:       driver.PCANSlave,
+	Baudrate:   19200,
+	Channels:   []liniface.Channel{0, 1},
+})
+```
+
+未设置 `HardwareHandles` 时，逻辑通道号按 `LIN_GetAvailableHardware` 的枚举顺序选择硬件；多设备环境可通过 `HardwareHandles` 显式绑定 PLIN 硬件句柄。DLL 会依次从注册表、Windows 系统目录、`./bin` 和系统 DLL 搜索路径加载。
+
 ### 非 Windows
 
 非 Windows 平台下没有真实硬件驱动实现，但可以使用：
@@ -257,7 +288,7 @@ go test ./...
 
 - 当前从站实现的诊断服务是基础子集，不是完整 LIN 诊断规范实现
 - `uds_client.Client` 目前提供的是通用收发能力，不内置完整 UDS 服务封装
-- Toomoss 驱动为平台相关实现，实际可用性取决于本机 DLL 和设备环境
+- Toomoss、PCAN/PLIN 驱动为平台相关实现，实际可用性取决于本机 DLL、驱动和设备环境
 
 ## License
 
