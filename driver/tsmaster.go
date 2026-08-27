@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"math"
 	"path/filepath"
 	"runtime"
@@ -335,6 +334,7 @@ func NewTSMaster(deviceType int, channels ...liniface.Channel) (*TSMaster, error
 		t.Close()
 		return nil, err
 	}
+	logDriverf(logDeviceTSMaster, "initialized channels=%v device_type=%d", t.channels, t.deviceType)
 
 	return t, nil
 }
@@ -486,7 +486,7 @@ func (t *TSMaster) callInitProcedures() error {
 
 	// 官方 C# LIN demo：connect 之后立刻 register_event_lin，收包走回调。
 	if err := t.registerLinEvent(); err != nil {
-		log.Printf("tsapp_register_event_lin: %v (fallback to FIFO)", err)
+		logDriverf(logDeviceTSMaster, "receive_mode=fifo callback_registration_error=%v", err)
 	}
 
 	// 必须在 connect 之后设置，否则返回 81（通道尚未连接到硬件）。
@@ -614,7 +614,10 @@ func (t *TSMaster) dispatchLIN(msg tsmasterLIN, channel liniface.Channel) {
 		return
 	}
 
-	log.Printf("RX LIN: ID=0x%02X, Len=%02d, CS=%02X, Err=%02X, Data=% 02X", msg.FIdentifier, dlc, msg.FChecksum, msg.FErrStatus, payload)
+	logLINMessage(logDeviceTSMaster, "RX", channel, id, msg.FChecksum, payload)
+	if msg.FErrStatus != 0 {
+		logDriverf(logDeviceTSMaster, "LIN channel=%d id=0x%02X status=error error_flags=0x%02X", channel, id, msg.FErrStatus)
+	}
 
 	evt := &liniface.LinEvent{
 		Channel:      channel,
@@ -627,6 +630,7 @@ func (t *TSMaster) dispatchLIN(msg tsmasterLIN, channel liniface.Channel) {
 	select {
 	case t.eventChannel(evt.Channel) <- evt:
 	default:
+		logDriverf(logDeviceTSMaster, "queue_overflow channel=%d id=0x%02X action=drop", evt.Channel, evt.EventID)
 	}
 }
 
@@ -737,9 +741,10 @@ func (t *TSMaster) WriteMessage(event *liniface.LinEvent, channel liniface.Chann
 	if r != 0 {
 		return fmt.Errorf("tsapp_transmit_lin_async failed: %d", r)
 	}
-	log.Printf("TX LIN: ID=0x%02X, Len=%02d, CS=%02X, Data=% 02X", msg.FIdentifier, msg.FDLC, msg.FChecksum, msg.FData[:msg.FDLC])
+	logLINMessage(logDeviceTSMaster, "TX", channel, msg.FIdentifier, msg.FChecksum, msg.FData[:msg.FDLC])
 
 	txCopy := *event
+	txCopy.EventPayload = append([]byte(nil), event.EventPayload...)
 	txCopy.Channel = channel
 	txCopy.Direction = liniface.TX
 	txCopy.Timestamp = time.Now()
@@ -779,7 +784,7 @@ func (t *TSMaster) MasterWrite(frameID byte, data []byte, channel liniface.Chann
 	if r != 0 {
 		return fmt.Errorf("tsapp_transmit_lin_async failed: %d (%s)", r, t.errorText(r))
 	}
-	logLINMessage("TX", frameID, msg.FDLC, msg.FChecksum, msg.FData[:msg.FDLC])
+	logLINMessage(logDeviceTSMaster, "TX", channel, frameID, msg.FChecksum, msg.FData[:msg.FDLC])
 	return nil
 }
 
@@ -806,7 +811,7 @@ func (t *TSMaster) MasterRead(frameID byte, channel liniface.Channel) ([]byte, e
 			continue
 		}
 		result := append([]byte(nil), evt.EventPayload...)
-		logLINMessage("RX", frameID, byte(len(result)), 0, result)
+		logLINMessage(logDeviceTSMaster, "RX", channel, frameID, 0, result)
 		return result, nil
 	}
 }
@@ -834,10 +839,10 @@ func (t *TSMaster) RequestSlaveResponse(frameID byte, channel liniface.Channel) 
 	t.callMu.Lock()
 	r, _, _ := t.transmitProc.Call(uintptr(unsafe.Pointer(&msg)))
 	t.callMu.Unlock()
-	log.Printf("TX HDR LIN: ID=0x%02X, Len=%02d, ret=%d", frameID, msg.FDLC, r)
 	if r != 0 {
 		return fmt.Errorf("tsapp_transmit_lin_async (header) failed: %d (%s)", r, t.errorText(r))
 	}
+	logLINHeader(logDeviceTSMaster, channel, frameID, msg.FDLC)
 	return nil
 }
 
@@ -913,6 +918,9 @@ func (t *TSMaster) Close() error {
 		}
 		if loader != nil {
 			loader.close()
+		}
+		if connected {
+			logDriverf(logDeviceTSMaster, "disconnected")
 		}
 
 		t.eventMu.Lock()

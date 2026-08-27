@@ -1,6 +1,7 @@
 package tplin
 
 import (
+	"errors"
 	"log"
 	"sync"
 	"time"
@@ -106,7 +107,7 @@ func (n *SimulatedLinNetwork) scheduleSlaveResponse(linEvent *liniface.LinEvent)
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	key := simulatedResponseKey{channel: linEvent.Channel, frameID: linEvent.EventID}
-	n.slaveResponses[key] = linEvent
+	n.slaveResponses[key] = deepCopyEvent(linEvent)
 }
 
 // --- Driver factory methods ---
@@ -138,6 +139,12 @@ type SimulatedLinDriver struct {
 	network     *SimulatedLinNetwork
 	eventMu     sync.Mutex
 	eventQueues map[liniface.Channel]chan *liniface.LinEvent
+	readStates  map[liniface.Channel]*simulatedReadState
+}
+
+type simulatedReadState struct {
+	mu    sync.Mutex
+	timer *time.Timer
 }
 
 func newSimulatedLinDriver(network *SimulatedLinNetwork, isSlave bool) *SimulatedLinDriver {
@@ -145,6 +152,7 @@ func newSimulatedLinDriver(network *SimulatedLinNetwork, isSlave bool) *Simulate
 		isSlave:     isSlave,
 		network:     network,
 		eventQueues: make(map[liniface.Channel]chan *liniface.LinEvent),
+		readStates:  make(map[liniface.Channel]*simulatedReadState),
 	}
 }
 
@@ -159,26 +167,49 @@ func (d *SimulatedLinDriver) pushEvent(event *liniface.LinEvent) {
 // --- Implementation of the Driver interface ---
 
 func (d *SimulatedLinDriver) ReadEvent(timeout time.Duration, channel liniface.Channel) (*liniface.LinEvent, error) {
+	eventQueue := d.eventQueue(channel)
+	if timeout <= 0 {
+		select {
+		case event := <-eventQueue:
+			return event, nil
+		default:
+			return nil, nil
+		}
+	}
+
+	state := d.readState(channel)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	resetTimer(state.timer, timeout)
 	select {
-	case event := <-d.eventQueue(channel):
+	case event := <-eventQueue:
+		stopTimer(state.timer)
 		return event, nil
-	case <-time.After(timeout):
+	case <-state.timer.C:
 		return nil, nil // Timeout is not an error
 	}
 }
 
 func (d *SimulatedLinDriver) WriteMessage(linEvent *liniface.LinEvent, channel liniface.Channel) error {
+	if linEvent == nil {
+		return errors.New("nil LIN event")
+	}
 	if !d.isSlave {
-		linEvent.Channel = channel
-		d.network.writeMessage(linEvent)
+		event := deepCopyEvent(linEvent)
+		event.Channel = channel
+		d.network.writeMessage(event)
 	}
 	return nil
 }
 
 func (d *SimulatedLinDriver) ScheduleSlaveResponse(linEvent *liniface.LinEvent, channel liniface.Channel) error {
+	if linEvent == nil {
+		return errors.New("nil LIN event")
+	}
 	if d.isSlave {
-		linEvent.Channel = channel
-		d.network.scheduleSlaveResponse(linEvent)
+		event := deepCopyEvent(linEvent)
+		event.Channel = channel
+		d.network.scheduleSlaveResponse(event)
 	}
 	return nil
 }
@@ -199,4 +230,31 @@ func (d *SimulatedLinDriver) eventQueue(channel liniface.Channel) chan *liniface
 		d.eventQueues[channel] = eventQueue
 	}
 	return eventQueue
+}
+
+func (d *SimulatedLinDriver) readState(channel liniface.Channel) *simulatedReadState {
+	d.eventMu.Lock()
+	defer d.eventMu.Unlock()
+	state := d.readStates[channel]
+	if state == nil {
+		timer := time.NewTimer(time.Hour)
+		timer.Stop()
+		state = &simulatedReadState{timer: timer}
+		d.readStates[channel] = state
+	}
+	return state
+}
+
+func resetTimer(timer *time.Timer, timeout time.Duration) {
+	stopTimer(timer)
+	timer.Reset(timeout)
+}
+
+func stopTimer(timer *time.Timer) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
 }

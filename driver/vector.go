@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -361,9 +360,14 @@ func (v *Vector) open() error {
 	if err := v.api.statusAccess("xlActivateChannel", v.api.activateChannel, v.portHandle, v.accessMask, uintptr(vectorBusTypeLIN), uintptr(vectorActivateNone)); err != nil {
 		return err
 	}
-	if printLogEnabled() {
-		log.Printf("Vector LIN initialized: Channels=%v, Mode=%s, Baudrate=%d, Version=%s", v.config.Channels, v.config.Mode, v.config.Baudrate, v.config.Version)
-	}
+	logDriverf(
+		logDeviceVector,
+		"initialized channels=%v mode=%s baudrate=%d version=%s",
+		v.config.Channels,
+		v.config.Mode,
+		v.config.Baudrate,
+		v.config.Version,
+	)
 	return nil
 }
 
@@ -497,8 +501,8 @@ func (v *Vector) readOne() (*liniface.LinEvent, bool, error) {
 		return nil, false, fmt.Errorf("xlReceive: %s", v.api.errorString(code))
 	}
 	if raw.Tag != vectorLINMessageTag {
-		if printLogEnabled() && (raw.Tag == vectorLINErrorTag || raw.Tag == vectorLINSyncErrTag || raw.Tag == vectorLINNoAnswer) {
-			log.Printf("Vector LIN bus event: tag=%d channelIndex=%d", raw.Tag, raw.ChannelIndex)
+		if raw.Tag == vectorLINErrorTag || raw.Tag == vectorLINSyncErrTag || raw.Tag == vectorLINNoAnswer {
+			logDriverf(logDeviceVector, "LIN status=bus_event tag=%d channel_index=%d", raw.Tag, raw.ChannelIndex)
 		}
 		return nil, false, nil
 	}
@@ -514,7 +518,7 @@ func (v *Vector) readOne() (*liniface.LinEvent, bool, error) {
 	if event.Direction == liniface.TX {
 		label = "TX"
 	}
-	logLINMessage(label, event.EventID, byte(len(event.EventPayload)), crc, event.EventPayload)
+	logLINMessage(logDeviceVector, label, logical, event.EventID, crc, event.EventPayload)
 	return event, false, nil
 }
 
@@ -575,7 +579,7 @@ func (v *Vector) WriteMessage(event *liniface.LinEvent, channel liniface.Channel
 	if err := v.api.linSendRequestForID(v.portHandle, info.mask, event.EventID); err != nil {
 		return err
 	}
-	logLINMessage("TX REQUEST", event.EventID, byte(len(event.EventPayload)), 0, event.EventPayload)
+	logLINMessage(logDeviceVector, "TX", channel, event.EventID, 0, event.EventPayload)
 	return nil
 }
 
@@ -601,7 +605,7 @@ func (v *Vector) ScheduleSlaveResponse(event *liniface.LinEvent, channel linifac
 	if err := v.api.linSwitchSlaveMode(v.portHandle, info.mask, event.EventID, vectorLINSlaveOn); err != nil {
 		return err
 	}
-	logLINMessage("SCHEDULE TX", event.EventID, byte(len(event.EventPayload)), 0, event.EventPayload)
+	logLINMessage(logDeviceVector, "TX_SCHEDULE", channel, event.EventID, 0, event.EventPayload)
 	return nil
 }
 
@@ -626,9 +630,7 @@ func (v *Vector) RequestSlaveResponse(frameID byte, channel liniface.Channel) er
 	if err := v.api.linSendRequestForID(v.portHandle, info.mask, frameID); err != nil {
 		return err
 	}
-	if printLogEnabled() {
-		log.Printf("TX HDR LIN: Channel=%d, ID=0x%02X, Len=%d", channel, frameID, v.dlcTable[frameID])
-	}
+	logLINHeader(logDeviceVector, channel, frameID, v.dlcTable[frameID])
 	return nil
 }
 
@@ -770,9 +772,7 @@ func (v *Vector) enqueueEvent(channel liniface.Channel, event *liniface.LinEvent
 	select {
 	case v.eventChannel(channel) <- event:
 	default:
-		if printLogEnabled() {
-			log.Printf("Vector LIN event queue for channel %d is full; dropping frame 0x%02X", channel, event.EventID)
-		}
+		logDriverf(logDeviceVector, "queue_overflow channel=%d id=0x%02X action=drop", channel, event.EventID)
 	}
 }
 
@@ -857,6 +857,11 @@ func (v *Vector) Close() error {
 			}
 		}
 		v.closeErr = errors.Join(errs...)
+		if v.closeErr != nil {
+			logDriverf(logDeviceVector, "disconnect status=failed error=%v", v.closeErr)
+		} else {
+			logDriverf(logDeviceVector, "disconnected")
+		}
 	})
 	return v.closeErr
 }

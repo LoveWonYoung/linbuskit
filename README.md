@@ -12,7 +12,7 @@
 - 提供从站 `tplin.LinSlave`，可模拟 ECU 节点并处理基础诊断服务
 - 提供 `uds_client.Client`，用于发送 UDS 请求并处理正响应、负响应和超时
 - 提供模拟网络 `tplin.SimulatedLinNetwork`，方便联调和单元测试
-- Windows 下支持 Toomoss 设备驱动接入
+- Windows 下支持 Toomoss、PCAN/PLIN、Vector XL LIN 和 TSMaster，macOS（Darwin + cgo）下支持 Toomoss
 
 ## 包结构
 
@@ -20,7 +20,7 @@
 liniface/     底层接口定义，包含 Driver、LinEvent、校验类型等
 tplin/        LIN 诊断传输层、主站/从站封装、模拟网络
 uds_client/   更高层的 UDS over LIN 客户端
-driver/       驱动实现（Windows Toomoss、非 Windows MockDriver）
+driver/       硬件驱动实现（Windows 多厂商、macOS Toomoss）
 ```
 
 ## 安装
@@ -128,6 +128,18 @@ func main() {
 - `payload[1:]` 是服务数据
 - 返回结果包含完整响应字节流，即 `响应 SID + 响应数据`
 - 若收到负响应，返回值中仍会包含 `0x7F ...` 原始响应数据，便于上层继续处理
+- 默认不自动重试，避免超时后重复执行非幂等诊断服务
+
+只应为确认可安全重复的 SID 显式开启超时重试：
+
+```go
+config := uds_client.DefaultClientConfig(0x01)
+config.MaxRetries = 2
+config.RetryableSIDs = map[byte]bool{
+	0x22: true, // ReadDataByIdentifier
+}
+client := uds_client.NewClientWithConfig(masterDriver, config)
+```
 
 ## 核心能力
 
@@ -148,6 +160,23 @@ type Driver interface {
 
 `tplin.NewMaster(driver, channel)`、`tplin.NewSlave(..., driver, channel)` 可将实例绑定到指定通道；省略 `channel` 时使用通道 `0`。`uds_client.ClientConfig.Channel` 提供同样的选择能力。
 
+### 设备日志
+
+所有 `driver` 设备日志默认关闭，并由同一个进程级开关控制。需要查看 DLL 加载、初始化、收发帧、Header、无响应、队列溢出和关闭日志时，应在创建设备前启用：
+
+```go
+driver.SetPrintLog(true)
+defer driver.SetPrintLog(false)
+```
+
+帧日志统一使用以下字段与格式：
+
+```text
+[PCAN] LIN direction=RX channel=0 id=0x3D length=8 checksum=0xA5 data=01 02 03 04 05 06 07 08
+```
+
+设备可能是 `PCAN`、`TOOMOSS`、`TSMASTER` 或 `VECTOR`。未调用 `SetPrintLog(true)` 时，设备驱动不会直接向标准日志输出内容；操作失败仍通过返回值或错误通道报告。
+
 ### `tplin`
 
 提供 LIN 诊断传输层和主从站能力：
@@ -162,6 +191,7 @@ type Driver interface {
   - `GetSlaveSerialNumber`
   - `SendDiagnostic`
   - `ReceiveDiagnostic`
+  - `ReceiveDiagnosticWithContext`
 - `LinSlave` 当前已实现/处理：
   - `ReadByIdentifier (0xB2)`
   - `AssignNad (0xB0)`
@@ -175,13 +205,14 @@ type Driver interface {
 - 支持超时控制和 `context.Context`
 - 自动处理正响应 SID（`requestSID + 0x40`）
 - 自动识别负响应 `0x7F`
-- 会对 `NRC 0x78`（Response Pending）持续等待
+- 收到 `NRC 0x78`（Response Pending）后切换到可配置的 `ResponsePendingTimeout`（P2*，默认 5 秒）
+- 默认禁用自动重试；`MaxRetries` 只对 `RetryableSIDs` 中显式允许的 SID 生效
 
 ## 真实硬件接入
 
-### Windows: Toomoss
+### Windows / macOS: Toomoss
 
-仓库中的 `driver.NewToomoss()` 提供了对 Toomoss LIN 设备的接入，适用于 Windows 环境。
+仓库中的 `driver.NewToomoss()` 提供 Toomoss LIN 设备接入。Windows 使用 DLL；macOS 实现要求 Darwin、cgo 和对应动态库。
 
 ```go
 package main
@@ -219,17 +250,17 @@ func main() {
 
 注意：
 
-- `driver/toomoss.go` 仅在 Windows 下参与编译
+- `driver/toomoss.go` 仅在 Windows 下参与编译；`driver/toomoss_darwin.go` 仅在 Darwin 且启用 cgo 时参与编译
 - 同一设备只创建一个 `Toomoss` 实例，并在构造时一次传入所有需要使用的 LIN 通道
-- 代码会尝试从注册表或默认路径加载 `USB2XXX.dll` / `libusb-1.0.dll`
-- 运行前需要确认 Toomoss 驱动和相关 DLL 已正确安装
+- Windows 会尝试从注册表或默认路径加载 `USB2XXX.dll` / `libusb-1.0.dll`
+- 运行前需要确认对应平台的 Toomoss 驱动和动态库已正确安装
 
 ### Windows: PEAK PCAN / PLIN
 
 `driver.NewPCAN()` 使用 PEAK 的 `PLinApi.dll` 接入 PCAN-USB Pro、PCAN-USB Pro FD 或 PLIN-USB。默认配置为主站、19200 baud、逻辑通道 0：
 
 ```go
-driver.SetPrintLog(true) // 打印 PCAN 初始化、收发帧、请求头、从站预置和关闭日志
+driver.SetPrintLog(true) // 全局启用所有设备驱动日志
 
 dev, err := driver.NewPCAN()
 if err != nil {
@@ -287,12 +318,31 @@ dev, err := driver.NewVectorWithConfig(driver.VectorConfig{
 
 从站模式使用 `VectorLINSlave`。驱动实现了主站报文发送、从站响应 header 请求、从站响应预置和 LIN 事件接收，并额外提供 `WakeUp`、`SetSleepMode`、`FlushReceiveQueue`、`ReceiveQueueLevel`。诊断帧 ID `0x3C/0x3D` 固定使用经典校验；其它 ID 默认使用增强校验，可通过 `Checksum` 覆盖。DLL 会依次从注册表、Windows 系统目录、`./bin` 和系统 DLL 搜索路径加载，也可通过 `DLLPath` 指定。
 
-### 非 Windows
+### Windows: TSMaster
 
-非 Windows 平台下没有真实硬件驱动实现，但可以使用：
+`driver.NewTSMaster()` 通过 TSMaster DLL 接入支持的 LIN 设备。构造参数是仓库中定义的设备类型和逻辑通道：
+
+```go
+dev, err := driver.NewTSMaster(driver.TL1001, 0)
+if err != nil {
+	log.Fatal(err)
+}
+defer dev.Close()
+
+config := uds_client.DefaultClientConfig(0x01)
+client := uds_client.NewClientWithConfig(dev, config)
+defer client.Close()
+```
+
+运行前需要安装匹配架构的 TSMaster 和设备驱动，并确认目标设备类型、应用通道映射及 LIN 波特率配置正确。
+
+### 无硬件模拟
+
+不连接真实设备时，所有平台都可以使用：
 
 - `tplin.SimulatedLinNetwork` 做总线级联调
-- `driver.MockDriver` 做更轻量的驱动侧测试
+
+Linux 当前没有仓库内置的真实硬件驱动；macOS 可在 Darwin + cgo 环境使用 Toomoss。
 
 ## 测试
 
@@ -308,6 +358,8 @@ go test ./...
 - 多帧发送与重组
 - 大报文重组
 - UDS 请求、超时、负响应处理
+- 生命周期幂等、关闭唤醒、通道隔离和事件所有权
+- 显式 SID 超时重试策略
 
 ## 适用场景
 
@@ -320,7 +372,7 @@ go test ./...
 
 - 当前从站实现的诊断服务是基础子集，不是完整 LIN 诊断规范实现
 - `uds_client.Client` 目前提供的是通用收发能力，不内置完整 UDS 服务封装
-- Toomoss、PCAN/PLIN、Vector XL LIN 驱动为平台相关实现，实际可用性取决于本机 DLL、驱动和设备环境
+- Toomoss、PCAN/PLIN、Vector XL LIN、TSMaster 驱动为平台相关实现，实际可用性取决于本机动态库、驱动和设备环境
 
 ## License
 

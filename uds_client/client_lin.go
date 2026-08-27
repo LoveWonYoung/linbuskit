@@ -11,13 +11,27 @@ import (
 	"github.com/LoveWonYoung/linbuskit/tplin"
 )
 
-var ErrResponseTimeout = errors.New("waiting for UDS response timed out")
+var (
+	ErrResponseTimeout = errors.New("waiting for UDS response timed out")
+	ErrEmptyRequest    = errors.New("UDS request payload is empty")
+)
 
 // ClientConfig holds configuration options for the UDS client.
 type ClientConfig struct {
-	TargetNad      byte
+	// TargetNad is the default destination NAD.
+	TargetNad byte
+	// DefaultTimeout is the initial response timeout used when SendAndRec gets
+	// a non-positive timeout.
 	DefaultTimeout time.Duration
-	MaxRetries     int
+	// ResponsePendingTimeout is the P2* timeout restarted by each matching
+	// NRC 0x78 response.
+	ResponsePendingTimeout time.Duration
+	// MaxRetries is the number of retries after the first timeout. Retries are
+	// disabled unless the request SID is also present in RetryableSIDs.
+	MaxRetries int
+	// RetryableSIDs explicitly identifies services that are safe to repeat.
+	// The map is copied by NewClientWithConfig.
+	RetryableSIDs map[byte]bool
 	// Channel selects the LIN channel used by this client.
 	Channel liniface.Channel
 	// ContinuousSlavePoll 透传到 Transport：true 时空闲也持续请求 0x3D。
@@ -27,10 +41,31 @@ type ClientConfig struct {
 // DefaultClientConfig returns a configuration with sensible defaults.
 func DefaultClientConfig(targetNad byte) ClientConfig {
 	return ClientConfig{
-		TargetNad:      targetNad,
-		DefaultTimeout: 2 * time.Second,
-		MaxRetries:     3,
+		TargetNad:              targetNad,
+		DefaultTimeout:         2 * time.Second,
+		ResponsePendingTimeout: 5 * time.Second,
 	}
+}
+
+func normalizeClientConfig(config ClientConfig) ClientConfig {
+	defaults := DefaultClientConfig(config.TargetNad)
+	if config.DefaultTimeout <= 0 {
+		config.DefaultTimeout = defaults.DefaultTimeout
+	}
+	if config.ResponsePendingTimeout <= 0 {
+		config.ResponsePendingTimeout = defaults.ResponsePendingTimeout
+	}
+	if config.MaxRetries < 0 {
+		config.MaxRetries = 0
+	}
+	if config.RetryableSIDs != nil {
+		retryableSIDs := make(map[byte]bool, len(config.RetryableSIDs))
+		for sid, enabled := range config.RetryableSIDs {
+			retryableSIDs[sid] = enabled
+		}
+		config.RetryableSIDs = retryableSIDs
+	}
+	return config
 }
 
 // Client 是一个高阶 UDS 客户端，用于与单个 LIN 从节点（ECU）进行诊断通信。
@@ -47,6 +82,7 @@ func NewClient(driver liniface.Driver, targetNad byte) *Client {
 
 // NewClientWithConfig 使用自定义配置创建客户端。
 func NewClientWithConfig(driver liniface.Driver, config ClientConfig) *Client {
+	config = normalizeClientConfig(config)
 	tpCfg := tplin.DefaultTransportConfig()
 	tpCfg.ContinuousSlavePoll = config.ContinuousSlavePoll
 	master := tplin.NewMasterWithConfig(driver, tpCfg, config.Channel)
@@ -62,7 +98,8 @@ func (c *Client) Close() {
 }
 
 // SendAndRec 使用默认 NAD 发送并等待响应，返回实际响应节点的 NAD。
-// timeout <= 0 时使用 DefaultTimeout；仅超时错误会按 MaxRetries 重试。
+// timeout <= 0 时使用 DefaultTimeout。仅当 SID 在 RetryableSIDs 中显式启用时，
+// 超时才会按 MaxRetries 重试。
 func (c *Client) SendAndRec(payload []byte, timeout time.Duration) (byte, []byte, error) {
 	return c.sendAndRecWithRetries(c.config.TargetNad, payload, timeout)
 }
@@ -71,7 +108,7 @@ func (c *Client) SendAndRec(payload []byte, timeout time.Duration) (byte, []byte
 func (c *Client) SendAndRecWithContext(ctx context.Context, payload []byte) (byte, []byte, error) {
 	c.requestMu.Lock()
 	defer c.requestMu.Unlock()
-	return c.sendAndRec(ctx, c.config.TargetNad, payload)
+	return c.sendAndRec(ctx, c.config.TargetNad, payload, 0)
 }
 
 // SendAndRecWithNAD 临时指定请求 NAD，并返回实际响应节点的 NAD。
@@ -80,32 +117,30 @@ func (c *Client) SendAndRecWithNAD(nad byte, payload []byte, timeout time.Durati
 }
 
 func (c *Client) sendAndRecWithRetries(nad byte, payload []byte, timeout time.Duration) (byte, []byte, error) {
+	if len(payload) == 0 {
+		return 0, nil, ErrEmptyRequest
+	}
 	c.requestMu.Lock()
 	defer c.requestMu.Unlock()
 	if timeout <= 0 {
 		timeout = c.config.DefaultTimeout
 	}
-	attempts := c.config.MaxRetries + 1
-	if attempts < 1 {
-		attempts = 1
+	maxRetries := 0
+	if c.config.RetryableSIDs[payload[0]] {
+		maxRetries = c.config.MaxRetries
 	}
-	var lastErr error
-	for attempt := 0; attempt < attempts; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		responseNAD, response, err := c.sendAndRec(ctx, nad, payload)
-		cancel()
-		if err == nil || !errors.Is(err, ErrResponseTimeout) {
+	for attempt := 0; ; attempt++ {
+		responseNAD, response, err := c.sendAndRec(context.Background(), nad, payload, timeout)
+		if err == nil || !errors.Is(err, ErrResponseTimeout) || attempt >= maxRetries {
 			return responseNAD, response, err
 		}
-		lastErr = err
 	}
-	return 0, nil, lastErr
 }
 
 // sendAndRec 核心实现，支持自定义 NAD 与外部 Context。
-func (c *Client) sendAndRec(ctx context.Context, nad byte, payload []byte) (byte, []byte, error) {
+func (c *Client) sendAndRec(ctx context.Context, nad byte, payload []byte, responseTimeout time.Duration) (byte, []byte, error) {
 	if len(payload) == 0 {
-		return 0, nil, fmt.Errorf("UDS请求负载不能为空")
+		return 0, nil, ErrEmptyRequest
 	}
 
 	// 1. 在发送前，清空接收队列中可能存在的残留消息。
@@ -119,52 +154,58 @@ func (c *Client) sendAndRec(ctx context.Context, nad byte, payload []byte) (byte
 	sid := payload[0]
 	data := payload[1:]
 	if err := c.master.SendDiagnostic(nad, sid, data); err != nil {
-		return 0, nil, fmt.Errorf("发送UDS请求失败: %w", err)
+		return 0, nil, fmt.Errorf("send UDS request: %w", err)
 	}
 	// 无论成功/失败/超时，结束本次会话后停止空闲 0x3D 轮询（ContinuousSlavePoll=false 时生效）。
 	defer c.master.StopAwaitingSlaveResponse()
 
-	// 3. 轮询等待响应，支持超时/NRC/响应挂起处理。
-	ticker := time.NewTicker(2 * time.Millisecond)
-	defer ticker.Stop()
+	// 3. 阻塞等待响应。收到 NRC 0x78 后切换到 P2* 超时，并允许后续
+	// Response Pending 重新开始 P2* 计时；外部 Context 始终是总上限。
+	waitCtx, cancelWait := responseWaitContext(ctx, responseTimeout)
+	defer func() { cancelWait() }()
 
 	for {
-		select {
-		case <-ctx.Done():
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		msg, err := c.master.ReceiveDiagnosticWithContext(waitCtx)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				if ctx.Err() != nil {
+					return 0, nil, fmt.Errorf("UDS request context ended: %w", ctx.Err())
+				}
 				return 0, nil, ErrResponseTimeout
 			}
-			return 0, nil, fmt.Errorf("操作被取消: %w", ctx.Err())
-		case err, ok := <-c.master.Errors():
-			if !ok {
-				return 0, nil, tplin.ErrTransportClosed
+			if errors.Is(err, context.Canceled) {
+				return 0, nil, fmt.Errorf("UDS request context ended: %w", err)
 			}
-			if err != nil {
-				return 0, nil, fmt.Errorf("LIN传输失败: %w", err)
-			}
-		case <-ticker.C:
-			msg := c.master.ReceiveDiagnostic()
-			if msg == nil {
+			return 0, nil, fmt.Errorf("LIN transport failed: %w", err)
+		}
+		if nad != tplin.BroadcastNAD && msg.NAD != nad {
+			continue
+		}
+		if msg.SID == 0x7F { // Negative Response
+			if len(msg.Data) < 2 || msg.Data[0] != sid {
 				continue
 			}
-			if nad != tplin.BroadcastNAD && msg.NAD != nad {
+			if msg.Data[1] == 0x78 {
+				cancelWait()
+				waitCtx, cancelWait = responseWaitContext(ctx, c.config.ResponsePendingTimeout)
 				continue
 			}
-			if msg.SID == 0x7F { // Negative Response
-				if len(msg.Data) < 2 || msg.Data[0] != sid {
-					continue
-				}
-				if msg.Data[1] == 0x78 {
-					// Response Pending, 继续等待（仍保持 awaiting，继续读 0x3D）
-					continue
-				}
-				fullNrcResponse := append([]byte{msg.SID}, msg.Data...)
-				return msg.NAD, fullNrcResponse, fmt.Errorf("server : %02X 收到负响应 (NRC: 0x%02X - %s)", msg.SID, msg.Data[1], GetNrcString(msg.Data[1]))
-			}
-			if msg.SID == (sid + 0x40) { // Positive Response
-				fullPositiveResponse := append([]byte{msg.SID}, msg.Data...)
-				return msg.NAD, fullPositiveResponse, nil
+			fullNrcResponse := append([]byte{msg.SID}, msg.Data...)
+			return msg.NAD, fullNrcResponse, &tplin.NegativeResponseError{
+				RequestedSID: msg.Data[0],
+				NRC:          msg.Data[1],
 			}
 		}
+		if msg.SID == (sid + 0x40) { // Positive Response
+			fullPositiveResponse := append([]byte{msg.SID}, msg.Data...)
+			return msg.NAD, fullPositiveResponse, nil
+		}
 	}
+}
+
+func responseWaitContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, timeout)
 }

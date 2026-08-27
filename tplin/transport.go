@@ -32,25 +32,8 @@ func DefaultTransportConfig() TransportConfig {
 	}
 }
 
-// bufferPool is used to reduce memory allocations for frame payloads.
-var bufferPool = sync.Pool{
-	New: func() interface{} {
-		buf := make([]byte, 8)
-		return &buf
-	},
-}
-
-// getBuffer retrieves a buffer from the pool.
-func getBuffer() *[]byte {
-	return bufferPool.Get().(*[]byte)
-}
-
-// putBuffer returns a buffer to the pool after resetting it.
-func putBuffer(buf *[]byte) {
-	for i := range *buf {
-		(*buf)[i] = 0xFF
-	}
-	bufferPool.Put(buf)
+func newDiagnosticFramePayload() []byte {
+	return []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
 }
 
 // Transport handles the logic of the LIN transport protocol (TP).
@@ -77,15 +60,16 @@ type Transport struct {
 	multiFrameStartTime time.Time // 多帧接收开始时间
 
 	// Goroutine lifecycle
-	lifecycleMu sync.Mutex
-	running     bool
-	closed      bool
-	cancel      context.CancelFunc
-	done        chan struct{}
-	wake        chan struct{}
-	errors      chan error
-	wg          sync.WaitGroup
-	txMu        sync.Mutex
+	lifecycleMu   sync.Mutex
+	running       bool
+	closed        bool
+	cancel        context.CancelFunc
+	done          chan struct{}
+	wake          chan struct{}
+	errors        chan error
+	receiveErrors chan error
+	wg            sync.WaitGroup
+	txMu          sync.Mutex
 }
 
 // LinMessage represents a fully decoded, high-level diagnostic message.
@@ -108,15 +92,16 @@ func NewTransportWithConfig(isSlave bool, driver liniface.Driver, config Transpo
 		selectedChannel = channel[0]
 	}
 	return &Transport{
-		isSlave: isSlave,
-		driver:  driver,
-		channel: selectedChannel,
-		txQueue: make(chan *liniface.LinEvent, config.TxQueueSize),
-		rxQueue: make(chan *LinMessage, config.RxQueueSize),
-		config:  config,
-		done:    make(chan struct{}),
-		wake:    make(chan struct{}, 1),
-		errors:  make(chan error, 16),
+		isSlave:       isSlave,
+		driver:        driver,
+		channel:       selectedChannel,
+		txQueue:       make(chan *liniface.LinEvent, config.TxQueueSize),
+		rxQueue:       make(chan *LinMessage, config.RxQueueSize),
+		config:        config,
+		done:          make(chan struct{}),
+		wake:          make(chan struct{}, 1),
+		errors:        make(chan error, 16),
+		receiveErrors: make(chan error, 16),
 	}
 }
 
@@ -192,6 +177,7 @@ func (t *Transport) Close() {
 	}
 	t.wg.Wait()
 	close(t.errors)
+	close(t.receiveErrors)
 	close(t.done)
 }
 
@@ -206,6 +192,10 @@ func (t *Transport) reportError(err error) {
 	case t.errors <- err:
 	default:
 		log.Printf("transport error channel full: %v", err)
+	}
+	select {
+	case t.receiveErrors <- err:
+	default:
 	}
 }
 
@@ -314,11 +304,19 @@ func (t *Transport) Receive() *LinMessage {
 	}
 }
 
-// ReceiveBlocking waits for a message or context cancellation.
+// ReceiveBlocking waits for a message, an asynchronous transport error,
+// transport closure, or context cancellation.
 func (t *Transport) ReceiveBlocking(ctx context.Context) (*LinMessage, error) {
 	select {
 	case msg := <-t.rxQueue:
 		return msg, nil
+	case err, ok := <-t.receiveErrors:
+		if !ok {
+			return nil, ErrTransportClosed
+		}
+		return nil, err
+	case <-t.done:
+		return nil, ErrTransportClosed
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -379,38 +377,29 @@ func (t *Transport) buildFrames(nad, sid byte, data []byte) ([]*liniface.LinEven
 	dataLen := len(data) + 1
 	if dataLen <= 6 {
 		pci := (byte(liniface.SF) << 4) | byte(dataLen)
-		bufPtr := getBuffer()
-		payload := *bufPtr
+		payload := newDiagnosticFramePayload()
 		payload[0] = nad
 		payload[1] = pci
 		payload[2] = sid
 		copy(payload[3:], data)
-		eventPayload := make([]byte, 8)
-		copy(eventPayload, payload)
-		putBuffer(bufPtr)
-		frames = append(frames, &liniface.LinEvent{Channel: t.channel, EventID: eventID, EventPayload: eventPayload, ChecksumType: liniface.ClassicChecksum})
+		frames = append(frames, &liniface.LinEvent{Channel: t.channel, EventID: eventID, EventPayload: payload, ChecksumType: liniface.ClassicChecksum})
 	} else {
 
 		pci := (byte(liniface.FF) << 4) | byte(dataLen>>8&0x0F)
-		bufPtrFF := getBuffer()
-		payloadFF := *bufPtrFF
+		payloadFF := newDiagnosticFramePayload()
 		payloadFF[0] = nad
 		payloadFF[1] = pci
 		payloadFF[2] = byte(dataLen & 0xFF)
 		payloadFF[3] = sid
 		copy(payloadFF[4:], data[:4])
-		eventPayloadFF := make([]byte, 8)
-		copy(eventPayloadFF, payloadFF)
-		putBuffer(bufPtrFF)
-		frames = append(frames, &liniface.LinEvent{Channel: t.channel, EventID: eventID, EventPayload: eventPayloadFF, ChecksumType: liniface.ClassicChecksum})
+		frames = append(frames, &liniface.LinEvent{Channel: t.channel, EventID: eventID, EventPayload: payloadFF, ChecksumType: liniface.ClassicChecksum})
 
 		currentByte := 4
 		currentFrame := 0
 		for currentByte < len(data) {
 			currentFrame = (currentFrame + 1) % 16
 			pciCF := (byte(liniface.CF) << 4) | byte(currentFrame)
-			bufPtrCF := getBuffer()
-			payloadCF := *bufPtrCF
+			payloadCF := newDiagnosticFramePayload()
 			payloadCF[0] = nad
 			payloadCF[1] = pciCF
 
@@ -420,10 +409,7 @@ func (t *Transport) buildFrames(nad, sid byte, data []byte) ([]*liniface.LinEven
 			}
 			copy(payloadCF[2:], data[currentByte:endByte])
 			currentByte = endByte
-			eventPayloadCF := make([]byte, 8)
-			copy(eventPayloadCF, payloadCF)
-			putBuffer(bufPtrCF)
-			frames = append(frames, &liniface.LinEvent{Channel: t.channel, EventID: eventID, EventPayload: eventPayloadCF, ChecksumType: liniface.ClassicChecksum})
+			frames = append(frames, &liniface.LinEvent{Channel: t.channel, EventID: eventID, EventPayload: payloadCF, ChecksumType: liniface.ClassicChecksum})
 		}
 	}
 	return frames, nil

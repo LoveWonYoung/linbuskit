@@ -5,7 +5,6 @@ package driver
 import (
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -161,29 +160,29 @@ func loadDLLs() error {
 
 	if runtime.GOARCH == "386" {
 		if registryPath := getRegistryPath(); registryPath != "" {
-			fmt.Println("Found registry path:", registryPath)
+			logDriverf(logDeviceToomoss, "registry_path=%s", registryPath)
 			libusbPath := filepath.Join(registryPath, "libusb-1.0.dll")
 			if _, err := syscall.LoadLibrary(libusbPath); err != nil {
-				fmt.Println("Warning: Failed to load libusb-1.0.dll from", libusbPath, "Error:", err)
+				logDriverf(logDeviceToomoss, "library=libusb-1.0.dll path=%s status=load_failed error=%v", libusbPath, err)
 			}
 
 			usbPath := filepath.Join(registryPath, "USB2XXX.dll")
 			if handle, err := syscall.LoadLibrary(usbPath); err == nil {
 				UsbDeviceDLL = handle
-				fmt.Println("Loaded DLLs from registry path:", registryPath)
+				logDriverf(logDeviceToomoss, "library=USB2XXX.dll path=%s status=loaded", usbPath)
 				return nil
 			} else {
-				fmt.Println("Failed to load USB2XXX.dll from", usbPath, "Error:", err)
+				logDriverf(logDeviceToomoss, "library=USB2XXX.dll path=%s status=load_failed error=%v", usbPath, err)
 			}
 		} else {
-			fmt.Println("Registry path not found")
+			logDriverf(logDeviceToomoss, "registry_path status=not_found")
 		}
 	}
 
 	dllDir := archDLLDir()
 	libusbPath := filepath.Join(".\\bin", dllDir, "libusb-1.0.dll")
 	if _, err := syscall.LoadLibrary(libusbPath); err != nil {
-		log.Printf("Warning: failed to load libusb-1.0.dll from %s: %v", libusbPath, err)
+		logDriverf(logDeviceToomoss, "library=libusb-1.0.dll path=%s status=load_failed error=%v", libusbPath, err)
 	}
 
 	usbPath := filepath.Join(".\\bin", dllDir, "USB2XXX.dll")
@@ -192,7 +191,7 @@ func loadDLLs() error {
 		return fmt.Errorf("failed to load USB2XXX.dll from %s: %w", usbPath, err)
 	}
 	UsbDeviceDLL = handle
-	log.Printf("Loaded DLLs from default path: %s", usbPath)
+	logDriverf(logDeviceToomoss, "library=USB2XXX.dll path=%s status=loaded", usbPath)
 	return nil
 }
 
@@ -279,7 +278,7 @@ func dirFromUninstallString(s string) string {
 func findRegistryPathInView(uninstall, label string, access uint32) string {
 	k, err := registry.OpenKey(registry.LOCAL_MACHINE, uninstall, access)
 	if err != nil {
-		fmt.Println("OpenKey HKLM", label, "view failed:", err)
+		logDriverf(logDeviceToomoss, "registry_view=%s status=open_failed error=%v", label, err)
 		return ""
 	}
 	defer func(k registry.Key) {
@@ -291,11 +290,11 @@ func findRegistryPathInView(uninstall, label string, access uint32) string {
 
 	names, err := k.ReadSubKeyNames(-1)
 	if err != nil {
-		fmt.Println("ReadSubKeyNames failed:", err)
+		logDriverf(logDeviceToomoss, "registry_view=%s status=read_failed error=%v", label, err)
 		return ""
 	}
 
-	fmt.Println("HKLM", label, "view entries:", len(names))
+	logDriverf(logDeviceToomoss, "registry_view=%s entries=%d", label, len(names))
 
 	for _, name := range names {
 		sk, err := registry.OpenKey(registry.LOCAL_MACHINE, uninstall+`\`+name, access)
@@ -317,31 +316,28 @@ func findRegistryPathInView(uninstall, label string, access uint32) string {
 		dnL := strings.ToLower(strings.TrimSpace(displayName))
 
 		if strings.Contains(pubL, "toomoss") || strings.Contains(dnL, "toomoss") {
-			fmt.Println("Matched subkey:", name)
-			fmt.Println("  DisplayName:", displayName)
-			fmt.Println("  Publisher:", publisher)
+			logDriverf(logDeviceToomoss, "registry_match subkey=%s display_name=%q publisher=%q", name, displayName, publisher)
 
 			install = strings.TrimSpace(install)
 			if install != "" {
-				fmt.Println("  InstallLocation:", install)
+				logDriverf(logDeviceToomoss, "registry_match source=install_location path=%s", install)
 				return filepath.Clean(install)
 			}
 
 			appPath = strings.TrimSpace(appPath)
 			if appPath != "" {
-				fmt.Println("  AppPath:", appPath)
+				logDriverf(logDeviceToomoss, "registry_match source=app_path path=%s", appPath)
 				return filepath.Clean(appPath)
 			}
 
 			if dir := dirFromUninstallString(unins); dir != "" {
-				fmt.Println("  From UninstallString:", dir)
+				logDriverf(logDeviceToomoss, "registry_match source=uninstall_string path=%s", dir)
 				if hasUSB2XXXDLL(dir) {
 					return dir
 				}
-				fmt.Println("  UninstallString path missing USB2XXX.dll")
 			}
 
-			fmt.Println("  No usable path fields")
+			logDriverf(logDeviceToomoss, "registry_match subkey=%s status=no_usable_path", name)
 		}
 	}
 
@@ -361,18 +357,18 @@ func findRegistryPathInView(uninstall, label string, access uint32) string {
 
 		install = strings.TrimSpace(install)
 		if install != "" && pathLooksToomoss(install) {
-			fmt.Println("Matched InstallLocation by path hint:", name)
+			logDriverf(logDeviceToomoss, "registry_hint subkey=%s source=install_location path=%s", name, install)
 			return filepath.Clean(install)
 		}
 
 		appPath = strings.TrimSpace(appPath)
 		if appPath != "" && pathLooksToomoss(appPath) {
-			fmt.Println("Matched AppPath by path hint:", name)
+			logDriverf(logDeviceToomoss, "registry_hint subkey=%s source=app_path path=%s", name, appPath)
 			return filepath.Clean(appPath)
 		}
 
 		if dir := dirFromUninstallString(unins); dir != "" && pathLooksToomoss(dir) {
-			fmt.Println("Matched UninstallString by path hint:", name)
+			logDriverf(logDeviceToomoss, "registry_hint subkey=%s source=uninstall_string path=%s", name, dir)
 			return dir
 		}
 	}
@@ -409,12 +405,12 @@ func usbScan() (bool, error) {
 
 func UsbScan() bool {
 	if err := ensureToomossLoaded(); err != nil {
-		log.Printf("USB scan failed (load DLLs): %v", err)
+		logDriverf(logDeviceToomoss, "usb_scan status=failed error=%v", err)
 		return false
 	}
 	ok, err := usbScan()
 	if err != nil {
-		log.Printf("USB scan failed: %v", err)
+		logDriverf(logDeviceToomoss, "usb_scan status=failed error=%v", err)
 		return false
 	}
 	return ok
@@ -436,12 +432,12 @@ func usbOpen() (bool, error) {
 
 func UsbOpen() bool {
 	if err := ensureToomossLoaded(); err != nil {
-		log.Printf("USB open failed (load DLLs): %v", err)
+		logDriverf(logDeviceToomoss, "usb_open status=failed error=%v", err)
 		return false
 	}
 	ok, err := usbOpen()
 	if err != nil {
-		log.Printf("USB open failed: %v", err)
+		logDriverf(logDeviceToomoss, "usb_open status=failed error=%v", err)
 		return false
 	}
 	return ok
@@ -505,7 +501,7 @@ func NewToomoss(channel []ToomossCh, mode byte) (*Toomoss, error) {
 			return nil, fmt.Errorf("failed to initialize Toomoss LIN device: ret=%d, err=%v", ret, err)
 		}
 	}
-	log.Println("Toomoss LIN device initialized successfully.")
+	logDriverf(logDeviceToomoss, "initialized channels=%v mode=%d baudrate=%d", channel, mode, Bt)
 
 	initializedChannels := make(map[liniface.Channel]struct{}, len(channel))
 	for _, ch := range channel {
@@ -620,8 +616,9 @@ func (d *Toomoss) WriteMessage(event *liniface.LinEvent, channel liniface.Channe
 	if ret <= 0 {
 		return fmt.Errorf("toomoss LIN write failed: ret=%d, err=%v", ret, err)
 	}
-	logLINMessage("TX", event.EventID, outMsg[0].DataLen, outMsg[0].Check, payload[:outMsg[0].DataLen])
+	logLINMessage(logDeviceToomoss, "TX", channel, event.EventID, outMsg[0].Check, payload[:outMsg[0].DataLen])
 	txEvent := *event
+	txEvent.EventPayload = append([]byte(nil), event.EventPayload...)
 	txEvent.Channel = channel
 	txEvent.Direction = liniface.TX
 	txEvent.Timestamp = time.Now()
@@ -629,6 +626,7 @@ func (d *Toomoss) WriteMessage(event *liniface.LinEvent, channel liniface.Channe
 	select {
 	case d.eventChannel(channel) <- &txEvent:
 	default:
+		logDriverf(logDeviceToomoss, "queue_overflow channel=%d id=0x%02X action=drop", channel, event.EventID)
 	}
 	return nil
 }
@@ -657,7 +655,7 @@ func (d *Toomoss) MasterWrite(frameID byte, data []byte, channel ToomossCh) erro
 	if ret <= 0 {
 		return fmt.Errorf("toomoss LIN write failed: ret=%d, err=%v", ret, err)
 	}
-	logLINMessage("TX", frameID, outMsg[0].DataLen, outMsg[0].Check, payload[:outMsg[0].DataLen])
+	logLINMessage(logDeviceToomoss, "TX", liniface.Channel(channel), frameID, outMsg[0].Check, payload[:outMsg[0].DataLen])
 	return nil
 }
 
@@ -678,7 +676,7 @@ func (d *Toomoss) MasterRead(frameID byte, channel ToomossCh) ([]byte, error) {
 	}
 	result := make([]byte, dataLen)
 	copy(result, outMsg[0].Data[:dataLen])
-	logLINMessage("RX", frameID, byte(dataLen), outMsg[0].Check, outMsg[0].Data[:dataLen])
+	logLINMessage(logDeviceToomoss, "RX", liniface.Channel(channel), frameID, outMsg[0].Check, outMsg[0].Data[:dataLen])
 	return result, nil
 }
 
@@ -690,7 +688,7 @@ func (d *Toomoss) RequestSlaveResponse(frameID byte, channel liniface.Channel) e
 	ret, _ := d.LinMasterSync(msg, outMsg, channel)
 
 	if ret <= 0 {
-		log.Printf("RX : 0x%02X (No response from slave)", frameID)
+		logLINNoResponse(logDeviceToomoss, channel, frameID)
 		return nil
 	}
 
@@ -700,11 +698,11 @@ func (d *Toomoss) RequestSlaveResponse(frameID byte, channel liniface.Channel) e
 		dataLen = byte(len(responseData))
 	}
 	if dataLen == 0 {
-		log.Printf("RX : 0x%02X (No response from slave)", frameID)
+		logLINNoResponse(logDeviceToomoss, channel, frameID)
 		return nil
 	}
 	if ret == 1 {
-		logLINMessage("RX", frameID, dataLen, outMsg[0].Check, responseData[:dataLen])
+		logLINMessage(logDeviceToomoss, "RX", channel, frameID, outMsg[0].Check, responseData[:dataLen])
 	}
 
 	rxEvent := &liniface.LinEvent{
@@ -751,6 +749,11 @@ func (d *Toomoss) Close() error {
 		d.callMu.Lock()
 		closeErr = usbClose()
 		d.callMu.Unlock()
+		if closeErr != nil {
+			logDriverf(logDeviceToomoss, "disconnect status=failed error=%v", closeErr)
+		} else {
+			logDriverf(logDeviceToomoss, "disconnected")
+		}
 		toomossInstanceMu.Lock()
 		toomossInstanceActive = false
 		toomossInstanceMu.Unlock()

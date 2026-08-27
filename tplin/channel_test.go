@@ -68,3 +68,30 @@ func TestSimulatedDriverSeparatesSlaveResponsesByChannel(t *testing.T) {
 		t.Fatalf("channel 2 response = %#v", event)
 	}
 }
+
+func TestSimulatedDriverOwnsScheduledEvent(t *testing.T) {
+	network := NewSimulatedLinNetwork()
+	master := network.GetMasterDriver()
+	slave := network.CreateSlaveDriver()
+	channel := liniface.Channel(2)
+	response := &liniface.LinEvent{
+		EventID:      SlaveDiagnosticFrameID,
+		EventPayload: []byte{0x01, 0x01, 0x62},
+	}
+	if err := slave.ScheduleSlaveResponse(response, channel); err != nil {
+		t.Fatal(err)
+	}
+
+	response.Channel = 9
+	response.EventPayload[0] = 0x7F
+	if err := master.RequestSlaveResponse(SlaveDiagnosticFrameID, channel); err != nil {
+		t.Fatal(err)
+	}
+	event, err := master.ReadEvent(time.Millisecond, channel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event == nil || event.Channel != channel || event.EventPayload[0] != 0x01 {
+		t.Fatalf("scheduled event was aliased: %#v", event)
+	}
+}

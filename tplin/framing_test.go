@@ -1,5 +1,3 @@
-//go:build !windows
-
 package tplin
 
 import (
@@ -11,23 +9,23 @@ import (
 	"github.com/LoveWonYoung/linbuskit/liniface"
 )
 
-// MockLinDriver 是一个简单的测试用模拟驱动
-type MockLinDriver struct {
+// fakeLINDriver 是一个仅供本包测试使用的最小驱动。
+type fakeLINDriver struct {
 	mu        sync.Mutex
 	rxEvents  chan *liniface.LinEvent
 	txEvents  []*liniface.LinEvent
 	responses map[byte]*liniface.LinEvent
 }
 
-func NewMockLinDriver() *MockLinDriver {
-	return &MockLinDriver{
+func newFakeLINDriver() *fakeLINDriver {
+	return &fakeLINDriver{
 		rxEvents:  make(chan *liniface.LinEvent, 50),
 		txEvents:  make([]*liniface.LinEvent, 0),
 		responses: make(map[byte]*liniface.LinEvent),
 	}
 }
 
-func (d *MockLinDriver) ReadEvent(timeout time.Duration, channel liniface.Channel) (*liniface.LinEvent, error) {
+func (d *fakeLINDriver) ReadEvent(timeout time.Duration, channel liniface.Channel) (*liniface.LinEvent, error) {
 	select {
 	case e := <-d.rxEvents:
 		return e, nil
@@ -36,31 +34,36 @@ func (d *MockLinDriver) ReadEvent(timeout time.Duration, channel liniface.Channe
 	}
 }
 
-func (d *MockLinDriver) WriteMessage(event *liniface.LinEvent, channel liniface.Channel) error {
+func (d *fakeLINDriver) WriteMessage(event *liniface.LinEvent, channel liniface.Channel) error {
 	d.mu.Lock()
-	d.txEvents = append(d.txEvents, event)
+	eventCopy := *event
+	eventCopy.EventPayload = append([]byte(nil), event.EventPayload...)
+	d.txEvents = append(d.txEvents, &eventCopy)
 	d.mu.Unlock()
 	// 将 TX 事件放回队列供 transport 确认
-	txCopy := *event
+	txCopy := eventCopy
 	txCopy.Channel = channel
 	txCopy.Direction = liniface.TX
 	d.rxEvents <- &txCopy
 	return nil
 }
 
-func (d *MockLinDriver) ScheduleSlaveResponse(event *liniface.LinEvent, channel liniface.Channel) error {
+func (d *fakeLINDriver) ScheduleSlaveResponse(event *liniface.LinEvent, channel liniface.Channel) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.responses[event.EventID] = event
+	eventCopy := *event
+	eventCopy.EventPayload = append([]byte(nil), event.EventPayload...)
+	d.responses[event.EventID] = &eventCopy
 	return nil
 }
 
-func (d *MockLinDriver) RequestSlaveResponse(frameID byte, channel liniface.Channel) error {
+func (d *fakeLINDriver) RequestSlaveResponse(frameID byte, channel liniface.Channel) error {
 	d.mu.Lock()
 	if resp, ok := d.responses[frameID]; ok {
 		delete(d.responses, frameID)
 		d.mu.Unlock()
 		rxCopy := *resp
+		rxCopy.EventPayload = append([]byte(nil), resp.EventPayload...)
 		rxCopy.Channel = channel
 		rxCopy.Direction = liniface.RX
 		d.rxEvents <- &rxCopy
@@ -70,14 +73,22 @@ func (d *MockLinDriver) RequestSlaveResponse(frameID byte, channel liniface.Chan
 	return nil
 }
 
-func (d *MockLinDriver) TxEvents() []*liniface.LinEvent {
+func (d *fakeLINDriver) TxEvents() []*liniface.LinEvent {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return append([]*liniface.LinEvent(nil), d.txEvents...)
+	result := make([]*liniface.LinEvent, len(d.txEvents))
+	for i, event := range d.txEvents {
+		eventCopy := *event
+		eventCopy.EventPayload = append([]byte(nil), event.EventPayload...)
+		result[i] = &eventCopy
+	}
+	return result
 }
 
-func (d *MockLinDriver) InjectRxEvent(event *liniface.LinEvent) {
-	d.rxEvents <- event
+func (d *fakeLINDriver) InjectRxEvent(event *liniface.LinEvent) {
+	eventCopy := *event
+	eventCopy.EventPayload = append([]byte(nil), event.EventPayload...)
+	d.rxEvents <- &eventCopy
 }
 
 // =============================================================================
@@ -86,7 +97,7 @@ func (d *MockLinDriver) InjectRxEvent(event *liniface.LinEvent) {
 
 // TestSingleFrameTransmit 测试单帧发送
 func TestSingleFrameTransmit(t *testing.T) {
-	driver := NewMockLinDriver()
+	driver := newFakeLINDriver()
 	transport := NewTransport(false, driver) // Master mode
 	transport.Run()
 	defer transport.Close()
@@ -140,7 +151,7 @@ func TestSingleFrameTransmit(t *testing.T) {
 
 // TestMultiFrameTransmit 测试多帧发送
 func TestMultiFrameTransmit(t *testing.T) {
-	driver := NewMockLinDriver()
+	driver := newFakeLINDriver()
 	transport := NewTransport(false, driver)
 	transport.Run()
 	defer transport.Close()
@@ -199,7 +210,7 @@ func TestMultiFrameTransmit(t *testing.T) {
 
 // TestSingleFrameReceive 测试单帧接收
 func TestSingleFrameReceive(t *testing.T) {
-	driver := NewMockLinDriver()
+	driver := newFakeLINDriver()
 	transport := NewTransport(false, driver)
 	transport.Run()
 	defer transport.Close()
@@ -252,7 +263,7 @@ func TestSingleFrameReceive(t *testing.T) {
 
 // TestNegativeResponse 测试否定响应处理
 func TestNegativeResponse(t *testing.T) {
-	driver := NewMockLinDriver()
+	driver := newFakeLINDriver()
 	transport := NewTransport(false, driver)
 	transport.Run()
 	defer transport.Close()
@@ -304,7 +315,7 @@ func TestNegativeResponse(t *testing.T) {
 // =============================================================================
 
 func BenchmarkSingleFrameTransmit(b *testing.B) {
-	driver := NewMockLinDriver()
+	driver := newFakeLINDriver()
 	transport := NewTransport(false, driver)
 
 	nad := byte(0x7F)
@@ -321,7 +332,7 @@ func BenchmarkSingleFrameTransmit(b *testing.B) {
 }
 
 func BenchmarkMultiFrameTransmit(b *testing.B) {
-	driver := NewMockLinDriver()
+	driver := newFakeLINDriver()
 	config := DefaultTransportConfig()
 	config.TxQueueSize = 32
 	transport := NewTransportWithConfig(false, driver, config)

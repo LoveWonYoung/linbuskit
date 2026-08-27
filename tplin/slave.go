@@ -23,10 +23,14 @@ type LinSlave struct {
 	frameIdentifiers []byte
 
 	// Internal
-	transport *Transport
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
-	mu        sync.Mutex // Protects access to slave properties
+	transport   *Transport
+	mu          sync.Mutex // Protects access to slave properties
+	lifecycleMu sync.Mutex
+	running     bool
+	closed      bool
+	cancel      context.CancelFunc
+	done        chan struct{}
+	wg          sync.WaitGroup
 }
 
 // NewSlave creates and initializes a new LinSlave instance.
@@ -42,20 +46,34 @@ func NewSlave(nad, variantID byte, supplierID, functionID uint16, serialNumber [
 		variantID:        variantID,
 		supplierID:       supplierID,
 		functionID:       functionID,
-		serialNumber:     serialNumber,
+		serialNumber:     append([]byte(nil), serialNumber...),
 		frameIdentifiers: make([]byte, 5),
 		transport:        transport,
+		done:             make(chan struct{}),
 	}
 }
 
 // Run starts the slave's main processing loop in a new goroutine.
+// Repeated calls are safe and do not start additional goroutines.
 func (s *LinSlave) Run() {
+	s.lifecycleMu.Lock()
+	if s.running || s.closed {
+		s.lifecycleMu.Unlock()
+		return
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
+	s.running = true
 	s.wg.Add(1)
+	s.lifecycleMu.Unlock()
 
 	go func() {
-		defer s.wg.Done()
+		defer func() {
+			s.lifecycleMu.Lock()
+			s.running = false
+			s.lifecycleMu.Unlock()
+			s.wg.Done()
+		}()
 		log.Printf("Slave (NAD 0x%X): Starting simulation loop", s.nad)
 		ticker := time.NewTicker(10 * time.Millisecond)
 		defer ticker.Stop()
@@ -73,12 +91,25 @@ func (s *LinSlave) Run() {
 }
 
 // Stop gracefully terminates the slave's processing loop.
+// It is safe to call Stop more than once or concurrently.
 func (s *LinSlave) Stop() {
-	if s.cancel != nil {
-		s.cancel()
+	s.lifecycleMu.Lock()
+	if s.closed {
+		done := s.done
+		s.lifecycleMu.Unlock()
+		<-done
+		return
+	}
+	s.closed = true
+	cancel := s.cancel
+	s.lifecycleMu.Unlock()
+
+	if cancel != nil {
+		cancel()
 	}
 	s.wg.Wait()
 	s.transport.Close()
+	close(s.done)
 }
 
 // simulate is the core logic loop, equivalent to the Python version's method.
@@ -144,7 +175,7 @@ func (s *LinSlave) getIDBytes(idType byte) []byte {
 		resp[4] = s.variantID
 		return resp
 	case DataIdentifierSerialNumber:
-		return s.serialNumber
+		return append([]byte(nil), s.serialNumber...)
 	default:
 		log.Printf("Slave (NAD 0x%X): Unsupported identifier type: %d", s.nad, idType)
 		return nil

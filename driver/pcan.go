@@ -5,7 +5,6 @@ package driver
 import (
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -388,15 +387,14 @@ func NewPCANWithConfig(config PCANConfig) (*PCAN, error) {
 		if err := p.connectAndInitialize(hardware); err != nil {
 			return nil, fmt.Errorf("initialize PCAN channel %d (hardware 0x%04X): %w", channel, hardware, err)
 		}
-		if printLogEnabled() {
-			log.Printf(
-				"PCAN LIN initialized: Channel=%d, Hardware=0x%04X, Mode=%s, Baudrate=%d",
-				channel,
-				hardware,
-				p.mode,
-				p.baudrate,
-			)
-		}
+		logDriverf(
+			logDevicePCAN,
+			"initialized channel=%d hardware=0x%04X mode=%s baudrate=%d",
+			channel,
+			hardware,
+			p.mode,
+			p.baudrate,
+		)
 	}
 
 	cleanup = false
@@ -609,9 +607,13 @@ func (p *PCAN) ReadEvent(timeout time.Duration, channel liniface.Channel) (*lini
 				continue
 			}
 			if message.ErrorFlags != 0 {
-				if printLogEnabled() {
-					log.Printf("PCAN LIN frame 0x%02X has error flags 0x%X", message.FrameID, message.ErrorFlags)
-				}
+				logDriverf(
+					logDevicePCAN,
+					"LIN channel=%d id=0x%02X status=error error_flags=0x%X",
+					messageChannel,
+					message.FrameID,
+					message.ErrorFlags,
+				)
 				continue
 			}
 
@@ -620,7 +622,7 @@ func (p *PCAN) ReadEvent(timeout time.Duration, channel liniface.Channel) (*lini
 			if event.Direction == liniface.TX {
 				direction = "TX"
 			}
-			logLINMessage(direction, event.EventID, message.Length, message.Checksum, event.EventPayload)
+			logLINMessage(logDevicePCAN, direction, messageChannel, event.EventID, message.Checksum, event.EventPayload)
 			if messageChannel == channel {
 				return event, nil
 			}
@@ -709,7 +711,7 @@ func (p *PCAN) WriteMessage(event *liniface.LinEvent, channel liniface.Channel) 
 	if err := p.write(&message, channel); err != nil {
 		return err
 	}
-	logLINMessage("TX", event.EventID, message.Length, message.Checksum, message.Data[:message.Length])
+	logLINMessage(logDevicePCAN, "TX", channel, event.EventID, message.Checksum, message.Data[:message.Length])
 
 	txEvent := *event
 	txEvent.Channel = channel
@@ -768,16 +770,7 @@ func (p *PCAN) RequestSlaveResponse(frameID byte, channel liniface.Channel) erro
 	if err := p.write(&message, channel); err != nil {
 		return err
 	}
-	if printLogEnabled() {
-		log.Printf(
-			"TX HDR LIN: Channel=%d, ID=0x%02X, PID=0x%02X, Len=%02d, CS=%02X",
-			channel,
-			frameID,
-			message.FrameID,
-			message.Length,
-			message.Checksum,
-		)
-	}
+	logLINHeader(logDevicePCAN, channel, frameID, message.Length)
 	return nil
 }
 
@@ -828,7 +821,7 @@ func (p *PCAN) ScheduleSlaveResponse(event *liniface.LinEvent, channel liniface.
 	); err != nil {
 		return err
 	}
-	logLINMessage("SCHEDULE TX", event.EventID, entry.Length, 0, event.EventPayload)
+	logLINMessage(logDevicePCAN, "TX_SCHEDULE", channel, event.EventID, 0, event.EventPayload)
 	return nil
 }
 
@@ -888,9 +881,7 @@ func (p *PCAN) enqueueEvent(channel liniface.Channel, event *liniface.LinEvent) 
 	select {
 	case p.eventChannel(channel) <- event:
 	default:
-		if printLogEnabled() {
-			log.Printf("PCAN event queue for channel %d is full; dropping frame 0x%02X", channel, event.EventID)
-		}
+		logDriverf(logDevicePCAN, "queue_overflow channel=%d id=0x%02X action=drop", channel, event.EventID)
 	}
 }
 
@@ -1028,8 +1019,8 @@ func (p *PCAN) Close() error {
 					uintptr(hardware),
 				); err != nil {
 					errs = append(errs, err)
-				} else if printLogEnabled() {
-					log.Printf("PCAN LIN disconnected: Hardware=0x%04X", hardware)
+				} else {
+					logDriverf(logDevicePCAN, "disconnected hardware=0x%04X", hardware)
 				}
 			}
 			if err := pcanCall("LIN_RemoveClient", p.api.removeClient, uintptr(p.client)); err != nil {

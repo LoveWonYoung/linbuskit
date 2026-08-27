@@ -1,5 +1,3 @@
-//go:build !windows
-
 package uds_client
 
 import (
@@ -13,16 +11,16 @@ import (
 	"github.com/LoveWonYoung/linbuskit/tplin"
 )
 
-// MockUDSDriver 是一个模拟 UDS 从节点的驱动
-type MockUDSDriver struct {
+// fakeUDSDriver 是一个仅供本包测试使用的 UDS 从节点驱动。
+type fakeUDSDriver struct {
 	mu              sync.Mutex
 	rxQueue         chan *liniface.LinEvent
 	txLog           []*liniface.LinEvent
 	responseHandler func(sid byte, data []byte) (byte, []byte, error)
 }
 
-func NewMockUDSDriver() *MockUDSDriver {
-	return &MockUDSDriver{
+func newFakeUDSDriver() *fakeUDSDriver {
+	return &fakeUDSDriver{
 		rxQueue: make(chan *liniface.LinEvent, 50),
 		txLog:   make([]*liniface.LinEvent, 0),
 	}
@@ -30,13 +28,13 @@ func NewMockUDSDriver() *MockUDSDriver {
 
 // SetHandler 设置 UDS 请求处理函数
 // handler 返回: (响应SID, 响应数据, 错误)
-func (d *MockUDSDriver) SetHandler(handler func(sid byte, data []byte) (byte, []byte, error)) {
+func (d *fakeUDSDriver) SetHandler(handler func(sid byte, data []byte) (byte, []byte, error)) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.responseHandler = handler
 }
 
-func (d *MockUDSDriver) ReadEvent(timeout time.Duration, channel liniface.Channel) (*liniface.LinEvent, error) {
+func (d *fakeUDSDriver) ReadEvent(timeout time.Duration, channel liniface.Channel) (*liniface.LinEvent, error) {
 	select {
 	case e := <-d.rxQueue:
 		return e, nil
@@ -45,27 +43,29 @@ func (d *MockUDSDriver) ReadEvent(timeout time.Duration, channel liniface.Channe
 	}
 }
 
-func (d *MockUDSDriver) WriteMessage(event *liniface.LinEvent, channel liniface.Channel) error {
+func (d *fakeUDSDriver) WriteMessage(event *liniface.LinEvent, channel liniface.Channel) error {
+	eventCopy := *event
+	eventCopy.EventPayload = append([]byte(nil), event.EventPayload...)
 	d.mu.Lock()
-	d.txLog = append(d.txLog, event)
+	d.txLog = append(d.txLog, &eventCopy)
 	handler := d.responseHandler
 	d.mu.Unlock()
 
 	// 将 TX 事件放回队列
-	txCopy := *event
+	txCopy := eventCopy
 	txCopy.Channel = channel
 	txCopy.Direction = liniface.TX
 	d.rxQueue <- &txCopy
 
 	// 解析请求并生成响应
 	if handler != nil && event.EventID == tplin.MasterDiagnosticFrameID {
-		go d.processRequest(event, handler)
+		go d.processRequest(&eventCopy, handler)
 	}
 
 	return nil
 }
 
-func (d *MockUDSDriver) processRequest(event *liniface.LinEvent, handler func(byte, []byte) (byte, []byte, error)) {
+func (d *fakeUDSDriver) processRequest(event *liniface.LinEvent, handler func(byte, []byte) (byte, []byte, error)) {
 	payload := event.EventPayload
 	if len(payload) < 3 {
 		return
@@ -119,11 +119,11 @@ func (d *MockUDSDriver) processRequest(event *liniface.LinEvent, handler func(by
 	}
 }
 
-func (d *MockUDSDriver) ScheduleSlaveResponse(event *liniface.LinEvent, channel liniface.Channel) error {
+func (d *fakeUDSDriver) ScheduleSlaveResponse(event *liniface.LinEvent, channel liniface.Channel) error {
 	return nil
 }
 
-func (d *MockUDSDriver) RequestSlaveResponse(frameID byte, channel liniface.Channel) error {
+func (d *fakeUDSDriver) RequestSlaveResponse(frameID byte, channel liniface.Channel) error {
 	return nil
 }
 
@@ -133,7 +133,7 @@ func (d *MockUDSDriver) RequestSlaveResponse(frameID byte, channel liniface.Chan
 
 // TestClientReadDataByIdentifier 测试读取数据标识符服务 (0x22)
 func TestClientReadDataByIdentifier(t *testing.T) {
-	driver := NewMockUDSDriver()
+	driver := newFakeUDSDriver()
 
 	// 设置模拟 ECU 响应
 	// 注意: 单帧最多可携带 5 字节数据 (SID + 5 bytes = 6 bytes total in PCI length)
@@ -182,7 +182,7 @@ func TestClientReadDataByIdentifier(t *testing.T) {
 }
 
 func TestClientIgnoresResponseFromDifferentNAD(t *testing.T) {
-	driver := NewMockUDSDriver()
+	driver := newFakeUDSDriver()
 	driver.SetHandler(func(sid byte, data []byte) (byte, []byte, error) {
 		return sid + 0x40, []byte{0xAA}, nil
 	})
@@ -211,7 +211,7 @@ func TestClientIgnoresResponseFromDifferentNAD(t *testing.T) {
 }
 
 func TestClientIgnoresMalformedNegativeResponse(t *testing.T) {
-	driver := NewMockUDSDriver()
+	driver := newFakeUDSDriver()
 	driver.SetHandler(func(sid byte, data []byte) (byte, []byte, error) {
 		return 0, nil, errors.New("reject")
 	})
@@ -238,7 +238,7 @@ func TestClientIgnoresMalformedNegativeResponse(t *testing.T) {
 
 // TestClientWithContext 测试带 Context 的请求
 func TestClientWithContext(t *testing.T) {
-	driver := NewMockUDSDriver()
+	driver := newFakeUDSDriver()
 
 	// 设置一个会延迟响应的处理器
 	driver.SetHandler(func(sid byte, data []byte) (byte, []byte, error) {
@@ -262,9 +262,42 @@ func TestClientWithContext(t *testing.T) {
 	t.Log("✅ Context 超时测试通过")
 }
 
+func TestClientRetriesOnlyExplicitSIDs(t *testing.T) {
+	tests := []struct {
+		name          string
+		retryableSIDs map[byte]bool
+		wantWrites    int
+	}{
+		{name: "disabled by default", wantWrites: 1},
+		{name: "explicitly enabled", retryableSIDs: map[byte]bool{0x22: true}, wantWrites: 3},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			driver := newFakeUDSDriver()
+			config := DefaultClientConfig(0x01)
+			config.DefaultTimeout = 30 * time.Millisecond
+			config.MaxRetries = 2
+			config.RetryableSIDs = test.retryableSIDs
+			client := NewClientWithConfig(driver, config)
+			defer client.Close()
+
+			_, _, err := client.SendAndRec([]byte{0x22}, 0)
+			if !errors.Is(err, ErrResponseTimeout) {
+				t.Fatalf("SendAndRec error = %v", err)
+			}
+			driver.mu.Lock()
+			writes := len(driver.txLog)
+			driver.mu.Unlock()
+			if writes != test.wantWrites {
+				t.Fatalf("write count = %d, want %d", writes, test.wantWrites)
+			}
+		})
+	}
+}
+
 // TestClientNegativeResponse 测试否定响应处理
 func TestClientNegativeResponse(t *testing.T) {
-	driver := NewMockUDSDriver()
+	driver := newFakeUDSDriver()
 
 	driver.SetHandler(func(sid byte, data []byte) (byte, []byte, error) {
 		// 总是返回否定响应
@@ -291,7 +324,7 @@ func TestClientNegativeResponse(t *testing.T) {
 
 // TestClientDiagnosticSession 测试诊断会话控制服务 (0x10)
 func TestClientDiagnosticSession(t *testing.T) {
-	driver := NewMockUDSDriver()
+	driver := newFakeUDSDriver()
 
 	driver.SetHandler(func(sid byte, data []byte) (byte, []byte, error) {
 		if sid == 0x10 && len(data) >= 1 {
@@ -327,7 +360,7 @@ func TestClientDiagnosticSession(t *testing.T) {
 // =============================================================================
 
 func BenchmarkClientSendAndRec(b *testing.B) {
-	driver := NewMockUDSDriver()
+	driver := newFakeUDSDriver()
 
 	driver.SetHandler(func(sid byte, data []byte) (byte, []byte, error) {
 		return sid + 0x40, data, nil

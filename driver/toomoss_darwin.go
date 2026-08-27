@@ -149,7 +149,6 @@ import "C"
 import (
 	"errors"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 	"unsafe"
@@ -281,7 +280,7 @@ func usbScan() (bool, error) {
 func UsbScan() bool {
 	ok, err := usbScan()
 	if err != nil {
-		log.Printf("USB scan failed: %v", err)
+		logDriverf(logDeviceToomoss, "usb_scan status=failed error=%v", err)
 		return false
 	}
 	return ok
@@ -299,7 +298,7 @@ func usbOpen() (bool, error) {
 func UsbOpen() bool {
 	ok, err := usbOpen()
 	if err != nil {
-		log.Printf("USB open failed: %v", err)
+		logDriverf(logDeviceToomoss, "usb_open status=failed error=%v", err)
 		return false
 	}
 	return ok
@@ -396,7 +395,7 @@ func NewToomoss(channels []ToomossCh, mode byte) (*Toomoss, error) {
 		}
 	}
 
-	log.Println("Toomoss LIN device initialized successfully.")
+	logDriverf(logDeviceToomoss, "initialized channels=%v mode=%d baudrate=%d", channels, mode, Bt)
 
 	initializedChannels := make(map[liniface.Channel]struct{}, len(channels))
 	for _, channel := range channels {
@@ -521,8 +520,9 @@ func (d *Toomoss) WriteMessage(event *liniface.LinEvent, channel liniface.Channe
 	if ret <= 0 {
 		return fmt.Errorf("toomoss LIN write failed: ret=%d, err=%v", ret, err)
 	}
-	logLINMessage("TX", event.EventID, outMsg[0].DataLen, outMsg[0].Check, payload[:outMsg[0].DataLen])
+	logLINMessage(logDeviceToomoss, "TX", channel, event.EventID, outMsg[0].Check, payload[:outMsg[0].DataLen])
 	txEvent := *event
+	txEvent.EventPayload = append([]byte(nil), event.EventPayload...)
 	txEvent.Channel = channel
 	txEvent.Direction = liniface.TX
 	txEvent.Timestamp = time.Now()
@@ -530,6 +530,7 @@ func (d *Toomoss) WriteMessage(event *liniface.LinEvent, channel liniface.Channe
 	select {
 	case d.eventChannel(channel) <- &txEvent:
 	default:
+		logDriverf(logDeviceToomoss, "queue_overflow channel=%d id=0x%02X action=drop", channel, event.EventID)
 	}
 	return nil
 }
@@ -558,7 +559,7 @@ func (d *Toomoss) MasterWrite(frameID byte, data []byte, channel ToomossCh) erro
 	if ret <= 0 {
 		return fmt.Errorf("toomoss LIN write failed: ret=%d, err=%v", ret, err)
 	}
-	logLINMessage("TX", frameID, outMsg[0].DataLen, outMsg[0].Check, payload[:outMsg[0].DataLen])
+	logLINMessage(logDeviceToomoss, "TX", liniface.Channel(channel), frameID, outMsg[0].Check, payload[:outMsg[0].DataLen])
 	return nil
 }
 
@@ -579,7 +580,7 @@ func (d *Toomoss) MasterRead(frameID byte, channel ToomossCh) ([]byte, error) {
 	}
 	result := make([]byte, dataLen)
 	copy(result, outMsg[0].Data[:dataLen])
-	logLINMessage("RX", frameID, byte(dataLen), outMsg[0].Check, outMsg[0].Data[:dataLen])
+	logLINMessage(logDeviceToomoss, "RX", liniface.Channel(channel), frameID, outMsg[0].Check, outMsg[0].Data[:dataLen])
 	return result, nil
 }
 
@@ -591,7 +592,7 @@ func (d *Toomoss) RequestSlaveResponse(frameID byte, channel liniface.Channel) e
 	ret, _ := d.LinMasterSync(msg, outMsg, channel)
 
 	if ret <= 0 {
-		log.Printf("RX : 0x%02X (No response from slave)", frameID)
+		logLINNoResponse(logDeviceToomoss, channel, frameID)
 		return nil
 	}
 
@@ -601,11 +602,11 @@ func (d *Toomoss) RequestSlaveResponse(frameID byte, channel liniface.Channel) e
 		dataLen = byte(len(responseData))
 	}
 	if dataLen == 0 {
-		log.Printf("RX : 0x%02X (No response from slave)", frameID)
+		logLINNoResponse(logDeviceToomoss, channel, frameID)
 		return nil
 	}
 	if ret == 1 {
-		logLINMessage("RX", frameID, dataLen, outMsg[0].Check, responseData[:dataLen])
+		logLINMessage(logDeviceToomoss, "RX", channel, frameID, outMsg[0].Check, responseData[:dataLen])
 	}
 
 	rxEvent := &liniface.LinEvent{
@@ -652,6 +653,11 @@ func (d *Toomoss) Close() error {
 		d.callMu.Lock()
 		closeErr = usbClose()
 		d.callMu.Unlock()
+		if closeErr != nil {
+			logDriverf(logDeviceToomoss, "disconnect status=failed error=%v", closeErr)
+		} else {
+			logDriverf(logDeviceToomoss, "disconnected")
+		}
 		toomossInstanceMu.Lock()
 		toomossInstanceActive = false
 		toomossInstanceMu.Unlock()

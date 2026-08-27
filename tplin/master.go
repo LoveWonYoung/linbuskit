@@ -93,13 +93,17 @@ func (m *LinMaster) waitForResponseWithContext(ctx context.Context, expectedRsid
 		if msg.SID == expectedRsid {
 			return msg, nil
 		} else if msg.SID == 0x7F { // Negative Response SID
-			if len(msg.Data) >= 2 {
+			requestedSID := expectedRsid - 0x40
+			if len(msg.Data) >= 2 && msg.Data[0] == requestedSID {
+				if msg.Data[1] == 0x78 {
+					continue
+				}
 				return nil, &NegativeResponseError{
 					RequestedSID: msg.Data[0],
 					NRC:          msg.Data[1],
 				}
 			}
-			return nil, ErrNegativeResponse
+			// Ignore malformed or unrelated negative responses on a shared channel.
 		}
 		// Ignore unrelated traffic on a shared LIN channel until timeout.
 	}
@@ -116,13 +120,12 @@ func (m *LinMaster) AssignSlaveNad(newNad byte, supplierID, functionID uint16, n
 	if err := m.transport.Transmit(nad, byte(sid), payload); err != nil {
 		return 0, err
 	}
+	defer m.transport.StopAwaitingSlaveResponse()
 
 	msg, err := m.waitForResponse(byte(sid)+0x40, nad, timeout)
 	if err != nil {
-		m.transport.StopAwaitingSlaveResponse()
 		return 0, err
 	}
-	m.transport.StopAwaitingSlaveResponse()
 	return msg.NAD, nil
 }
 
@@ -137,13 +140,12 @@ func (m *LinMaster) ReadByIdentifier(identifier byte, supplierID, functionID uin
 	if err := m.transport.Transmit(nad, byte(sid), payload); err != nil {
 		return 0, nil, err
 	}
+	defer m.transport.StopAwaitingSlaveResponse()
 
 	msg, err := m.waitForResponse(byte(sid)+0x40, nad, timeout)
 	if err != nil {
-		m.transport.StopAwaitingSlaveResponse()
 		return 0, nil, err
 	}
-	m.transport.StopAwaitingSlaveResponse()
 	return msg.NAD, msg.Data, nil
 }
 
@@ -187,4 +189,10 @@ func (m *LinMaster) Errors() <-chan error { return m.transport.Errors() }
 // ReceiveDiagnostic performs a single, non-blocking check for any diagnostic message.
 func (m *LinMaster) ReceiveDiagnostic() *LinMessage {
 	return m.transport.Receive()
+}
+
+// ReceiveDiagnosticWithContext waits for a diagnostic message, transport
+// failure, closure, or context cancellation.
+func (m *LinMaster) ReceiveDiagnosticWithContext(ctx context.Context) (*LinMessage, error) {
+	return m.transport.ReceiveBlocking(ctx)
 }
