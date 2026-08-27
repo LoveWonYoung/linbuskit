@@ -255,6 +255,38 @@ dev, err := driver.NewPCANWithConfig(driver.PCANConfig{
 
 未设置 `HardwareHandles` 时，逻辑通道号按 `LIN_GetAvailableHardware` 的枚举顺序选择硬件；多设备环境可通过 `HardwareHandles` 显式绑定 PLIN 硬件句柄。DLL 会依次从注册表、Windows 系统目录、`./bin` 和系统 DLL 搜索路径加载。
 
+### Windows: Vector XL LIN
+
+`driver.NewVector()` 使用 Vector XL Driver Library 接入 LIN。下面示例直接选择 VN1640（`XL_HWTYPE_VN1640 = 59`）的硬件通道 0，并以 LIN 2.1、19200 baud 主站模式启动：
+
+```go
+dev, err := driver.NewVector(59, 0)
+if err != nil {
+	log.Fatal(err)
+}
+defer dev.Close()
+
+config := uds_client.DefaultClientConfig(0x01)
+client := uds_client.NewClientWithConfig(dev, config)
+defer client.Close()
+```
+
+如果通道已经在 Vector Hardware Config 中分配给应用，建议按应用名和应用通道映射：
+
+```go
+dev, err := driver.NewVectorWithConfig(driver.VectorConfig{
+	AppName:      "xl",
+	UseAppConfig: true,
+	Channels:     []liniface.Channel{0, 1},
+	Mode:         driver.VectorLINMaster,
+	Baudrate:     19200,
+	Version:      driver.VectorLINVersion21,
+	DLC:          map[byte]byte{0x22: 4}, // 未配置的 ID 默认 DLC=8
+})
+```
+
+从站模式使用 `VectorLINSlave`。驱动实现了主站报文发送、从站响应 header 请求、从站响应预置和 LIN 事件接收，并额外提供 `WakeUp`、`SetSleepMode`、`FlushReceiveQueue`、`ReceiveQueueLevel`。诊断帧 ID `0x3C/0x3D` 固定使用经典校验；其它 ID 默认使用增强校验，可通过 `Checksum` 覆盖。DLL 会依次从注册表、Windows 系统目录、`./bin` 和系统 DLL 搜索路径加载，也可通过 `DLLPath` 指定。
+
 ### 非 Windows
 
 非 Windows 平台下没有真实硬件驱动实现，但可以使用：
@@ -288,7 +320,7 @@ go test ./...
 
 - 当前从站实现的诊断服务是基础子集，不是完整 LIN 诊断规范实现
 - `uds_client.Client` 目前提供的是通用收发能力，不内置完整 UDS 服务封装
-- Toomoss、PCAN/PLIN 驱动为平台相关实现，实际可用性取决于本机 DLL、驱动和设备环境
+- Toomoss、PCAN/PLIN、Vector XL LIN 驱动为平台相关实现，实际可用性取决于本机 DLL、驱动和设备环境
 
 ## License
 
