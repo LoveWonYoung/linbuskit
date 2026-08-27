@@ -101,6 +101,9 @@ type Toomoss struct {
 	eventChans map[liniface.Channel]chan *liniface.LinEvent
 }
 
+var _ liniface.Driver = (*Toomoss)(nil)
+var _ liniface.MasterReader = (*Toomoss)(nil)
+
 func toomossReady() bool {
 	return UsbDeviceDLL != 0 &&
 		UsbScanDevice != 0 &&
@@ -659,7 +662,13 @@ func (d *Toomoss) MasterWrite(frameID byte, data []byte, channel ToomossCh) erro
 	return nil
 }
 
+// MasterRead performs a synchronous master-header request and returns the slave
+// payload on channel. The returned payload is owned by the caller. It must not
+// run concurrently with another receive consumer on the same channel.
 func (d *Toomoss) MasterRead(frameID byte, channel ToomossCh) ([]byte, error) {
+	if frameID > 0x3F {
+		return nil, fmt.Errorf("invalid LIN frame ID 0x%02X", frameID)
+	}
 	msg := make([]LinExMsg, 1)
 	outMsg := make([]LinExMsg, 1)
 	msg[0].MsgType = LIN_EX_MSG_TYPE_MR
@@ -667,7 +676,7 @@ func (d *Toomoss) MasterRead(frameID byte, channel ToomossCh) ([]byte, error) {
 	ret, _ := d.LinMasterSync(msg, outMsg, channel)
 
 	if ret <= 0 {
-		return nil, errors.New("no response from slave")
+		return nil, ErrNoSlaveResponse
 	}
 
 	dataLen := int(outMsg[0].DataLen)

@@ -1,11 +1,77 @@
 package driver
 
 import (
+	"errors"
+	"fmt"
 	"log"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/LoveWonYoung/linbuskit/liniface"
 )
+
+const masterReadTimeout = 100 * time.Millisecond
+
+var (
+	// ErrNoSlaveResponse indicates that MasterRead did not receive a matching
+	// slave response before the driver's read timeout expired.
+	ErrNoSlaveResponse = errors.New("no response from slave")
+)
+
+type channelMutexes struct {
+	mu    sync.Mutex
+	locks map[liniface.Channel]*sync.Mutex
+}
+
+func (m *channelMutexes) lock(channel liniface.Channel) func() {
+	m.mu.Lock()
+	if m.locks == nil {
+		m.locks = make(map[liniface.Channel]*sync.Mutex)
+	}
+	channelLock := m.locks[channel]
+	if channelLock == nil {
+		channelLock = &sync.Mutex{}
+		m.locks[channel] = channelLock
+	}
+	m.mu.Unlock()
+
+	channelLock.Lock()
+	return channelLock.Unlock
+}
+
+func readMasterResponse(
+	frameID byte,
+	channel liniface.Channel,
+	timeout time.Duration,
+	request func(byte, liniface.Channel) error,
+	read func(time.Duration, liniface.Channel) (*liniface.LinEvent, error),
+) ([]byte, error) {
+	if frameID > 0x3F {
+		return nil, fmt.Errorf("invalid LIN frame ID 0x%02X", frameID)
+	}
+	if err := request(frameID, channel); err != nil {
+		return nil, err
+	}
+
+	deadline := time.Now().Add(timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, ErrNoSlaveResponse
+		}
+		event, err := read(remaining, channel)
+		if err != nil {
+			return nil, err
+		}
+		if event == nil || event.Channel != channel || event.EventID != frameID || event.Direction != liniface.RX {
+			continue
+		}
+		result := make([]byte, len(event.EventPayload))
+		copy(result, event.EventPayload)
+		return result, nil
+	}
+}
 
 const (
 	logDevicePCAN     = "PCAN"

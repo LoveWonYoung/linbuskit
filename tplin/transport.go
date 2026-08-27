@@ -61,6 +61,7 @@ type Transport struct {
 
 	// Goroutine lifecycle
 	lifecycleMu   sync.Mutex
+	executeMu     sync.Mutex
 	running       bool
 	closed        bool
 	cancel        context.CancelFunc
@@ -201,6 +202,9 @@ func (t *Transport) reportError(err error) {
 
 // execute is the main processing loop called periodically by the background goroutine.
 func (t *Transport) execute() error {
+	t.executeMu.Lock()
+	defer t.executeMu.Unlock()
+
 	t.lifecycleMu.Lock()
 	closed := t.closed
 	t.lifecycleMu.Unlock()
@@ -209,12 +213,21 @@ func (t *Transport) execute() error {
 	}
 	t.checkMultiFrameTimeout()
 
+	masterActive := false
+	if !t.isSlave {
+		masterActive = len(t.txQueue) > 0 || t.shouldRequestSlaveResponse()
+		if !masterActive {
+			return nil
+		}
+	}
+
 	readTimeout := t.config.ReadTimeout
-	if !t.isSlave && (len(t.txQueue) > 0 || t.shouldRequestSlaveResponse()) {
+	if !t.isSlave && masterActive {
 		// 待发 0x3C 或即将请求 0x3D 时不阻塞读，避免 ReadTimeout 叠加 PollInterval 导致帧间隔 ~18ms。
 		readTimeout = 0
 	}
 
+	receivedCompleteMessage := false
 	for {
 		event, err := t.driver.ReadEvent(readTimeout, t.channel)
 		if err != nil {
@@ -223,7 +236,9 @@ func (t *Transport) execute() error {
 		if event == nil {
 			break
 		}
-		t.receiveFromDriver(event)
+		if t.receiveFromDriver(event) {
+			receivedCompleteMessage = true
+		}
 	}
 
 	if t.isSlave {
@@ -245,7 +260,7 @@ func (t *Transport) execute() error {
 				return fmt.Errorf("master failed to write message: %w", err)
 			}
 		default:
-			if t.shouldRequestSlaveResponse() {
+			if !receivedCompleteMessage && t.shouldRequestSlaveResponse() {
 				if err := t.driver.RequestSlaveResponse(SlaveDiagnosticFrameID, t.channel); err != nil {
 					return fmt.Errorf("master failed to request slave response: %w", err)
 				}
@@ -269,14 +284,28 @@ func (t *Transport) shouldRequestSlaveResponse() bool {
 	return ongoing
 }
 
-// SetAwaitingSlaveResponse 设置是否正在等待从节点诊断响应。
+// SetAwaitingSlaveResponse updates the master response-wait state. Enabling it
+// wakes the transport immediately; disabling it includes the same execution
+// barrier as StopAwaitingSlaveResponse.
 func (t *Transport) SetAwaitingSlaveResponse(awaiting bool) {
-	t.awaitingSlaveResponse.Store(awaiting)
+	if !awaiting {
+		t.StopAwaitingSlaveResponse()
+		return
+	}
+	t.awaitingSlaveResponse.Store(true)
+	select {
+	case t.wake <- struct{}{}:
+	default:
+	}
 }
 
-// StopAwaitingSlaveResponse 停止等待从节点响应，从而在非持续轮询模式下停止请求 0x3D。
+// StopAwaitingSlaveResponse stops requesting 0x3D and waits for any execute
+// cycle that was already reading the driver to finish. After it returns, an
+// idle master transport will not call ReadEvent until another request starts.
 func (t *Transport) StopAwaitingSlaveResponse() {
 	t.awaitingSlaveResponse.Store(false)
+	t.executeMu.Lock()
+	t.executeMu.Unlock()
 }
 
 // checkMultiFrameTimeout 检查多帧接收是否超时
@@ -415,8 +444,9 @@ func (t *Transport) buildFrames(nad, sid byte, data []byte) ([]*liniface.LinEven
 	return frames, nil
 }
 
-// receiveFromDriver processes a raw event from the driver and updates the TP state.
-func (t *Transport) receiveFromDriver(event *liniface.LinEvent) {
+// receiveFromDriver processes a raw event and reports whether it delivered one
+// complete diagnostic message.
+func (t *Transport) receiveFromDriver(event *liniface.LinEvent) bool {
 	t.stateMutex.Lock()
 	defer t.stateMutex.Unlock()
 	if t.isSlave && event.Direction == liniface.TX && t.scheduledTxEvent != nil {
@@ -431,7 +461,7 @@ func (t *Transport) receiveFromDriver(event *liniface.LinEvent) {
 			default:
 			}
 		}
-		return
+		return false
 	}
 
 	// Check if the received event is a diagnostic frame relevant to our role
@@ -441,10 +471,10 @@ func (t *Transport) receiveFromDriver(event *liniface.LinEvent) {
 	if event.Direction == liniface.RX && (isMasterReceiving || isSlaveReceiving) {
 		payload := event.EventPayload
 		if !t.isSlave && len(payload) == 0 {
-			return // Master ignores empty frames (no-response from slave)
+			return false // Master ignores empty frames (no-response from slave)
 		}
 		if len(payload) < 2 {
-			return // Frame too short to be a valid diagnostic frame
+			return false // Frame too short to be a valid diagnostic frame
 		}
 
 		nad, pci := payload[0], payload[1]
@@ -461,11 +491,12 @@ func (t *Transport) receiveFromDriver(event *liniface.LinEvent) {
 			dataLength := length - 1
 			if len(payload) < 3+dataLength || dataLength < 0 {
 				log.Printf("Error: SF with invalid length field. Payload len: %d, PCI len: %d", len(payload), length)
-				return
+				return false
 			}
 			sid := payload[2]
 			data := append([]byte(nil), payload[3:3+dataLength]...)
 			t.deliverMessage(&LinMessage{NAD: nad, SID: sid, Data: data})
+			return true
 
 		case liniface.FF:
 			if t.remainingBytes > 0 {
@@ -474,12 +505,12 @@ func (t *Transport) receiveFromDriver(event *liniface.LinEvent) {
 			t.resetState()
 			if len(payload) < 8 {
 				log.Printf("Error: FF frame is smaller than 8 bytes.")
-				return
+				return false
 			}
 			length := (int(additionalInfo) << 8) | int(payload[2])
 			if length <= 6 || length > maxTransportDataLength+1 {
 				log.Printf("Error: FF with invalid transport length %d", length)
-				return
+				return false
 			}
 			sid := payload[3]
 			t.remainingBytes = length - 1 - 4
@@ -492,20 +523,20 @@ func (t *Transport) receiveFromDriver(event *liniface.LinEvent) {
 			if t.remainingBytes == 0 {
 				log.Println("Warning: Received a Consecutive-Frame but was not expecting more bytes. Discarding.")
 				t.resetState()
-				return
+				return false
 			}
 			frameCounter := additionalInfo
 			nextFrameCounter := byte(t.currentFrameCounter+1) % 16
 			if frameCounter != nextFrameCounter {
 				log.Println("Warning: Received an out-of-order Consecutive-Frame. Discarding message.")
 				t.resetState()
-				return
+				return false
 			}
 
 			length := min(t.remainingBytes, 6)
 			if len(payload) < 2+length {
 				t.resetState()
-				return
+				return false
 			}
 			t.remainingBytes -= length
 			t.currentFrameData = append(t.currentFrameData, payload[2:2+length]...)
@@ -515,9 +546,11 @@ func (t *Transport) receiveFromDriver(event *liniface.LinEvent) {
 				msg := &LinMessage{NAD: t.currentNAD, SID: t.currentSID, Data: t.currentFrameData}
 				t.deliverMessage(msg)
 				t.resetState()
+				return true
 			}
 		}
 	}
+	return false
 }
 
 func (t *Transport) deliverMessage(msg *LinMessage) {

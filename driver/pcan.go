@@ -316,11 +316,12 @@ func pcanCall(operation string, procedure uintptr, args ...uintptr) error {
 }
 
 type PCAN struct {
-	stateMu   sync.RWMutex
-	callMu    sync.Mutex
-	readMu    sync.Mutex
-	eventMu   sync.Mutex
-	closeOnce sync.Once
+	stateMu         sync.RWMutex
+	callMu          sync.Mutex
+	readMu          sync.Mutex
+	eventMu         sync.Mutex
+	closeOnce       sync.Once
+	masterReadLocks channelMutexes
 
 	api               *pcanAPI
 	client            byte
@@ -335,6 +336,7 @@ type PCAN struct {
 }
 
 var _ liniface.Driver = (*PCAN)(nil)
+var _ liniface.MasterReader = (*PCAN)(nil)
 
 // NewPCAN opens the selected logical channels using the default PCAN master
 // configuration.
@@ -752,6 +754,18 @@ func (p *PCAN) write(message *pcanMessage, channel liniface.Channel) error {
 		return err
 	}
 	return nil
+}
+
+// MasterRead sends a LIN header and waits up to 100 ms for the matching slave
+// response on channel. The returned payload is owned by the caller. It must not
+// run concurrently with another receive consumer on the same channel.
+func (p *PCAN) MasterRead(frameID byte, channel liniface.Channel) ([]byte, error) {
+	if p == nil {
+		return nil, liniface.ErrDriverClosed
+	}
+	unlock := p.masterReadLocks.lock(channel)
+	defer unlock()
+	return readMasterResponse(frameID, channel, masterReadTimeout, p.RequestSlaveResponse, p.ReadEvent)
 }
 
 func (p *PCAN) RequestSlaveResponse(frameID byte, channel liniface.Channel) error {

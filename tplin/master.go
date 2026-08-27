@@ -63,7 +63,9 @@ func (m *LinMaster) Close() {
 	m.transport.Close()
 }
 
-// StopAwaitingSlaveResponse stops requesting 0x3D when ContinuousSlavePoll is disabled.
+// StopAwaitingSlaveResponse stops requesting 0x3D and waits for the current
+// transport read cycle to finish. With ContinuousSlavePoll disabled, the driver
+// receive path is idle when this method returns.
 func (m *LinMaster) StopAwaitingSlaveResponse() {
 	m.transport.StopAwaitingSlaveResponse()
 }

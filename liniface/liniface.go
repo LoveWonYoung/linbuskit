@@ -48,3 +48,11 @@ type Driver interface {
 	ScheduleSlaveResponse(event *LinEvent, channel Channel) error
 	RequestSlaveResponse(frameID byte, channel Channel) error
 }
+
+// MasterReader is an optional hardware-driver capability for issuing one LIN
+// master header and synchronously waiting for the matching slave response. The
+// returned payload is owned by the caller. MasterRead must not be used alongside
+// another receive consumer on the same channel.
+type MasterReader interface {
+	MasterRead(frameID byte, channel Channel) ([]byte, error)
+}

@@ -11,6 +11,7 @@
 - 提供主站 `tplin.LinMaster`，封装常见诊断命令
 - 提供从站 `tplin.LinSlave`，可模拟 ECU 节点并处理基础诊断服务
 - 提供 `uds_client.Client`，用于发送 UDS 请求并处理正响应、负响应和超时
+- 提供 `preset.Preset`，一站式创建硬件驱动与指定 NAD/通道的 UDS 客户端
 - 提供模拟网络 `tplin.SimulatedLinNetwork`，方便联调和单元测试
 - Windows 下支持 Toomoss、PCAN/PLIN、Vector XL LIN 和 TSMaster，macOS（Darwin + cgo）下支持 Toomoss
 
@@ -21,6 +22,7 @@ liniface/     底层接口定义，包含 Driver、LinEvent、校验类型等
 tplin/        LIN 诊断传输层、主站/从站封装、模拟网络
 uds_client/   更高层的 UDS over LIN 客户端
 driver/       硬件驱动实现（Windows 多厂商、macOS Toomoss）
+preset/       硬件驱动与 UDS 客户端的便捷组合
 ```
 
 ## 安装
@@ -141,6 +143,41 @@ config.RetryableSIDs = map[byte]bool{
 client := uds_client.NewClientWithConfig(masterDriver, config)
 ```
 
+### 3. 使用硬件 preset
+
+如果使用默认的硬件主站配置，可以通过 `preset` 同时创建设备和绑定到目标 NAD、逻辑通道的 UDS 客户端。下面是 Windows 下的 PCAN/PLIN 示例：
+
+```go
+package main
+
+import (
+	"log"
+	"time"
+
+	"github.com/LoveWonYoung/linbuskit/preset"
+)
+
+func main() {
+	p, err := preset.NewPresetPCAN(0x01, 0)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		if err := p.Close(); err != nil {
+			log.Printf("close LIN preset: %v", err)
+		}
+	}()
+
+	responseNAD, response, err := p.Request([]byte{0x22, 0xF1, 0x89}, 2*time.Second)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("response NAD=0x%02X: % X", responseNAD, response)
+}
+```
+
+Windows 还提供 `NewPresetVector`、`NewPresetTSMaster` 和 `NewPresetToomoss`；macOS（Darwin + cgo）提供 `NewPresetToomoss`。`FunctionRequest` 使用广播 NAD `0x7F`，并返回实际响应节点的 NAD。`Write` 可在同一通道发送最多 8 字节的原始主站帧；`MasterRead(frameID)` 与 UDS 请求串行执行，请求结束的 transport 同步屏障会确保空闲接收循环已经退出。preset 拥有底层硬件驱动，`Close` 会先停止 UDS transport，再关闭设备；不要在 preset 活跃期间直接从 `LinDevice` 读取事件，否则会绕过 preset 的请求串行保护。
+
 ## 核心能力
 
 ### `liniface`
@@ -157,6 +194,8 @@ type Driver interface {
 ```
 
 只要实现这组接口，就可以把任意 LIN 适配器接入 `tplin` 和 `uds_client`。
+
+PCAN、Vector、TSMaster 和 Toomoss 硬件驱动还实现了可选的 `liniface.MasterReader`，可通过 `MasterRead(frameID, channel)` 发送主站 header 并同步取得从站 payload。PCAN、Vector 和 TSMaster 最多等待 100 ms；Toomoss 使用厂商同步 API。返回切片由调用者持有。`MasterRead` 会直接消费驱动接收事件，不应与同一通道上的 `tplin.Transport`、`uds_client.Client` 或其它 `ReadEvent` 调用并发使用。
 
 `tplin.NewMaster(driver, channel)`、`tplin.NewSlave(..., driver, channel)` 可将实例绑定到指定通道；省略 `channel` 时使用通道 `0`。`uds_client.ClientConfig.Channel` 提供同样的选择能力。
 
@@ -184,6 +223,7 @@ defer driver.SetPrintLog(false)
 - 诊断帧 ID 使用 `0x3C`（Master Request）和 `0x3D`（Slave Response）
 - 支持单帧 `SF`、首帧 `FF`、连续帧 `CF`
 - 支持多帧重组和接收超时清理
+- 默认配置下，主站空闲时不读取驱动；停止等待 `0x3D` 会同步等待当前读取周期退出
 - `LinMaster` 已封装：
   - `AssignSlaveNad`
   - `ReadByIdentifier`

@@ -214,6 +214,7 @@ func TestSingleFrameReceive(t *testing.T) {
 	transport := NewTransport(false, driver)
 	transport.Run()
 	defer transport.Close()
+	transport.SetAwaitingSlaveResponse(true)
 
 	// 构造一个单帧响应
 	nad := byte(0x7F)
@@ -267,6 +268,7 @@ func TestNegativeResponse(t *testing.T) {
 	transport := NewTransport(false, driver)
 	transport.Run()
 	defer transport.Close()
+	transport.SetAwaitingSlaveResponse(true)
 
 	// 构造一个否定响应
 	nad := byte(0x7F)

@@ -27,6 +27,7 @@ func testMultiFrameAssembly(t *testing.T, dataSize int) {
 	transport := NewTransport(false, driver)
 	transport.Run()
 	defer transport.Close()
+	transport.SetAwaitingSlaveResponse(true)
 
 	// --- 2. 定义测试数据 ---
 	originalNad := byte(0x1A)

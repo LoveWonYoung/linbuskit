@@ -170,11 +170,12 @@ type vectorAPI struct {
 
 // Vector implements liniface.Driver using the Vector XL Driver Library.
 type Vector struct {
-	stateMu   sync.RWMutex
-	callMu    sync.Mutex
-	readMu    sync.Mutex
-	eventMu   sync.Mutex
-	closeOnce sync.Once
+	stateMu         sync.RWMutex
+	callMu          sync.Mutex
+	readMu          sync.Mutex
+	eventMu         sync.Mutex
+	closeOnce       sync.Once
+	masterReadLocks channelMutexes
 
 	api        *vectorAPI
 	config     VectorConfig
@@ -192,6 +193,7 @@ type Vector struct {
 }
 
 var _ liniface.Driver = (*Vector)(nil)
+var _ liniface.MasterReader = (*Vector)(nil)
 
 // NewVector opens the selected Vector hardware channels as a LIN master.
 func NewVector(deviceType int, channels ...liniface.Channel) (*Vector, error) {
@@ -607,6 +609,18 @@ func (v *Vector) ScheduleSlaveResponse(event *liniface.LinEvent, channel linifac
 	}
 	logLINMessage(logDeviceVector, "TX_SCHEDULE", channel, event.EventID, 0, event.EventPayload)
 	return nil
+}
+
+// MasterRead sends a LIN header and waits up to 100 ms for the matching slave
+// response on channel. The returned payload is owned by the caller. It must not
+// run concurrently with another receive consumer on the same channel.
+func (v *Vector) MasterRead(frameID byte, channel liniface.Channel) ([]byte, error) {
+	if v == nil {
+		return nil, liniface.ErrDriverClosed
+	}
+	unlock := v.masterReadLocks.lock(channel)
+	defer unlock()
+	return readMasterResponse(frameID, channel, masterReadTimeout, v.RequestSlaveResponse, v.ReadEvent)
 }
 
 // RequestSlaveResponse disables the local response for frameID and sends only

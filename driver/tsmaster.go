@@ -34,8 +34,6 @@ const (
 
 	linPropertyDirTxMask = 0x01
 	linPropertyBreakMask = 0x02
-
-	masterReadTimeout = 100 * time.Millisecond
 )
 
 var defaultTSMasterChannels = []uint32{0}
@@ -296,8 +294,9 @@ type TSMaster struct {
 	connected  bool
 	deviceType int
 
-	dedupMu   sync.Mutex
-	lastFrame tsmasterLastFrame
+	dedupMu         sync.Mutex
+	lastFrame       tsmasterLastFrame
+	masterReadLocks channelMutexes
 }
 
 type tsmasterLastFrame struct {
@@ -311,6 +310,7 @@ type tsmasterLastFrame struct {
 }
 
 var _ liniface.Driver = (*TSMaster)(nil)
+var _ liniface.MasterReader = (*TSMaster)(nil)
 
 func NewTSMaster(deviceType int, channels ...liniface.Channel) (*TSMaster, error) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -788,32 +788,16 @@ func (t *TSMaster) MasterWrite(frameID byte, data []byte, channel liniface.Chann
 	return nil
 }
 
+// MasterRead sends a LIN header and waits up to 100 ms for the matching slave
+// response on channel. The returned payload is owned by the caller. It must not
+// run concurrently with another receive consumer on the same channel.
 func (t *TSMaster) MasterRead(frameID byte, channel liniface.Channel) ([]byte, error) {
 	if t == nil {
 		return nil, errors.New("tsmaster driver is nil")
 	}
-	if err := t.RequestSlaveResponse(frameID, channel); err != nil {
-		return nil, err
-	}
-
-	wantID := frameID & 0x3F
-	deadline := time.Now().Add(masterReadTimeout)
-	for {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return nil, errors.New("no response from slave")
-		}
-		evt, err := t.ReadEvent(remaining, channel)
-		if err != nil {
-			return nil, err
-		}
-		if evt == nil || evt.EventID != wantID || evt.Direction != liniface.RX || len(evt.EventPayload) == 0 {
-			continue
-		}
-		result := append([]byte(nil), evt.EventPayload...)
-		logLINMessage(logDeviceTSMaster, "RX", channel, frameID, 0, result)
-		return result, nil
-	}
+	unlock := t.masterReadLocks.lock(channel)
+	defer unlock()
+	return readMasterResponse(frameID, channel, masterReadTimeout, t.RequestSlaveResponse, t.ReadEvent)
 }
 
 func (t *TSMaster) RequestSlaveResponse(frameID byte, channel liniface.Channel) error {
