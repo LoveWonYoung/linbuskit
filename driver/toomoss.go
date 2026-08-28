@@ -27,6 +27,11 @@ var (
 	LinExInit         uintptr
 	LinExMasterSync   uintptr
 	LinEXSlaveGetData uintptr
+	ELINS_Init        uintptr
+	ELINS_GetMsg      uintptr
+	ELINS_SetRevTime  uintptr
+	ELINS_Stop        uintptr
+	LinEXCtrlPowerOut uintptr
 	DevHandle         [10]int
 	DEVIndex          = 0
 
@@ -64,6 +69,18 @@ const (
 	LIN_EX_CHECK_ERROR             // 接收数据校验错误
 )
 
+const (
+	LIN_EX_VBAT_0V  = 0
+	LIN_EX_VBAT_12V = 1
+	LIN_EX_VBAT_5V  = 2
+)
+
+const (
+	ELINS_VER_IND83080 = 0
+	ELINS_VER_IND83220 = 1
+	ELINS_VER_IND83010 = 2
+)
+
 type LinExMsg struct {
 	Timestamp uint32
 	MsgType   uint8
@@ -76,6 +93,120 @@ type LinExMsg struct {
 	BreakBits uint8
 	Reserve1  uint8
 }
+
+const (
+	ELINS_SUCCESS            = 0
+	ELINS_ERR_NOT_SUPPORT    = -1
+	ELINS_ERR_USB_WRITE_FAIL = -2
+	ELINS_ERR_USB_READ_FAIL  = -3
+	ELINS_ERR_CMD_FAIL       = -4
+	ELINS_ERR_PARAMETER      = -5
+)
+
+const (
+	ELINS_CMD_SDW  = 0x02
+	ELINS_CMD_SDR  = 0x03
+	ELINS_CMD_BW   = 0x04
+	ELINS_CMD_EBW  = 0x05
+	ELINS_CMD_ESDW = 0x06
+	ELINS_CMD_ESDR = 0x07
+)
+
+const (
+	ELINS_STATUS_NACK  = 0x01
+	ELINS_STATUS_RNRES = 0x02
+	ELINS_STATUS_ECRC  = 0x04
+	ELINS_STATUS_FERR  = 0x08
+	ELINS_STATUS_DLEN  = 0x10
+	ELINS_STATUS_ECMD  = 0x20
+)
+
+// ElinsMsg matches ELINS_MSG in elins.h (default MSVC/Go alignment, 88 bytes).
+type ElinsMsg struct {
+	DataLen       byte
+	BreakBits     byte
+	Status        byte
+	Flags         byte
+	SYNC          byte
+	TimeStampHigh byte
+	MsgSendTimes  uint16
+	TimeStamp     uint32
+	CmdCode       byte
+	DevID         byte
+	RegAddr       uint16
+	Crc16         uint16
+	Data          [64]byte
+	ACKValue      [4]byte
+}
+
+// ElinsMsgFilter reports whether a received ELINS frame should be kept.
+type ElinsMsgFilter func(ElinsMsg) bool
+
+func ElinsFilterDevID(ids ...byte) ElinsMsgFilter {
+	ids = append([]byte(nil), ids...)
+	return func(m ElinsMsg) bool {
+		return elinsContains(ids, m.DevID)
+	}
+}
+
+func ElinsFilterCmdCode(cmds ...byte) ElinsMsgFilter {
+	cmds = append([]byte(nil), cmds...)
+	return func(m ElinsMsg) bool {
+		return elinsContains(cmds, m.CmdCode)
+	}
+}
+
+func ElinsFilterRegAddr(addrs ...uint16) ElinsMsgFilter {
+	addrs = append([]uint16(nil), addrs...)
+	return func(m ElinsMsg) bool {
+		return elinsContains(addrs, m.RegAddr)
+	}
+}
+
+func ElinsFilterStatus(status byte) ElinsMsgFilter {
+	return func(m ElinsMsg) bool {
+		return m.Status == status
+	}
+}
+
+func ElinsFilterAnd(filters ...ElinsMsgFilter) ElinsMsgFilter {
+	filters = append([]ElinsMsgFilter(nil), filters...)
+	return func(m ElinsMsg) bool {
+		for _, f := range filters {
+			if f != nil && !f(m) {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+func FilterElinsMsgs(msgs []ElinsMsg, keep ElinsMsgFilter) []ElinsMsg {
+	if keep == nil {
+		return msgs
+	}
+	n := 0
+	for _, m := range msgs {
+		if keep(m) {
+			msgs[n] = m
+			n++
+		}
+	}
+	return msgs[:n]
+}
+
+func elinsContains[T comparable](xs []T, v T) bool {
+	if len(xs) == 0 {
+		return true
+	}
+	for _, x := range xs {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
 type ToomossCh = liniface.Channel
 
 const (
@@ -96,6 +227,7 @@ type Toomoss struct {
 	stateMu    sync.RWMutex
 	closeOnce  sync.Once
 	closed     bool
+	elinsMode  bool
 	channels   map[liniface.Channel]struct{}
 	eventMu    sync.Mutex
 	eventChans map[liniface.Channel]chan *liniface.LinEvent
@@ -122,6 +254,11 @@ func resetToomossState() {
 	LinExInit = 0
 	LinExMasterSync = 0
 	LinEXSlaveGetData = 0
+	ELINS_Init = 0
+	ELINS_GetMsg = 0
+	ELINS_SetRevTime = 0
+	ELINS_Stop = 0
+	LinEXCtrlPowerOut = 0
 }
 
 func ensureToomossLoaded() error {
@@ -235,10 +372,25 @@ func loadProcAddresses() error {
 	if LinEXSlaveGetData, err = getProc("LIN_EX_SlaveGetData"); err != nil {
 		errs = append(errs, err.Error())
 	}
+	loadOptionalProc("ELINS_Init", &ELINS_Init)
+	loadOptionalProc("ELINS_GetMsg", &ELINS_GetMsg)
+	loadOptionalProc("ELINS_SetRevTime", &ELINS_SetRevTime)
+	loadOptionalProc("ELINS_Stop", &ELINS_Stop)
+	loadOptionalProc("LIN_EX_CtrlPowerOut", &LinEXCtrlPowerOut)
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+func loadOptionalProc(name string, dest *uintptr) {
+	addr, err := getProc(name)
+	if err != nil {
+		logDriverf(logDeviceToomoss, "proc=%s status=not_available error=%v", name, err)
+		*dest = 0
+		return
+	}
+	*dest = addr
 }
 
 func getRegistryPath() string {
@@ -517,6 +669,101 @@ func NewToomoss(channel []ToomossCh, mode byte) (*Toomoss, error) {
 	}, nil
 }
 
+func ensureElinsReady() error {
+	if err := ensureToomossLoaded(); err != nil {
+		return fmt.Errorf("load Toomoss DLLs: %w", err)
+	}
+	if ELINS_Init == 0 || ELINS_GetMsg == 0 {
+		return errors.New("ELINS APIs are not available in USB2XXX.dll")
+	}
+	return nil
+}
+
+// NewToomossElins opens the Toomoss adapter and initializes ELINS channels in slave mode.
+// baudrate is in bps (2000–5000000), resEnable 0/1, ver 0=iND83080/081, 1=iND83220, 2=iND83010.
+func NewToomossElins(channel []ToomossCh, baudrate uint32, resEnable byte, ver byte) (*Toomoss, error) {
+	toomossInstanceMu.Lock()
+	defer toomossInstanceMu.Unlock()
+	if toomossInstanceActive {
+		return nil, errors.New("a Toomoss device instance is already active; configure all channels on that instance")
+	}
+	if len(channel) == 0 {
+		return nil, errors.New("at least one ELINS channel is required")
+	}
+	if err := ensureElinsReady(); err != nil {
+		return nil, err
+	}
+	if ok := UsbScan(); !ok {
+		return nil, fmt.Errorf("USB scan failed: device not found or DLL missing")
+	}
+	if ok := UsbOpen(); !ok {
+		return nil, fmt.Errorf("USB open failed")
+	}
+	for _, ch := range channel {
+		ret, _, err := syscall.SyscallN(
+			ELINS_Init,
+			uintptr(DevHandle[DEVIndex]),
+			uintptr(ch),
+			uintptr(baudrate),
+			uintptr(SlaveMode),
+			uintptr(resEnable),
+			uintptr(ver),
+		)
+		if int(ret) != ELINS_SUCCESS {
+			_ = usbClose()
+			return nil, fmt.Errorf("failed to initialize Toomoss ELINS device: ret=%d, err=%v", int(ret), err)
+		}
+		if ELINS_SetRevTime != 0 {
+			revRet, _, revErr := syscall.SyscallN(
+				ELINS_SetRevTime,
+				uintptr(DevHandle[DEVIndex]),
+				uintptr(ch),
+				uintptr(1000),
+			)
+			if int(revRet) != ELINS_SUCCESS {
+				_ = usbClose()
+				return nil, fmt.Errorf("ELINS_SetRevTime failed: ret=%d, err=%v", int(revRet), revErr)
+			}
+		}
+	}
+	logDriverf(logDeviceToomoss, "elins_initialized channels=%v baudrate=%d res=%d ver=%d mode=slave", channel, baudrate, resEnable, ver)
+
+	initializedChannels := make(map[liniface.Channel]struct{}, len(channel))
+	for _, ch := range channel {
+		initializedChannels[ch] = struct{}{}
+	}
+	toomossInstanceActive = true
+	return &Toomoss{
+		elinsMode:  true,
+		channels:   initializedChannels,
+		eventChans: make(map[liniface.Channel]chan *liniface.LinEvent),
+	}, nil
+}
+
+func (d *Toomoss) LinExCtrlPowerOut(channel ToomossCh, vbat byte) error {
+	if LinEXCtrlPowerOut == 0 {
+		return errors.New("LIN_EX_CtrlPowerOut not loaded")
+	}
+	d.callMu.Lock()
+	defer d.callMu.Unlock()
+	if err := d.validateChannel(channel); err != nil {
+		return err
+	}
+	ret, _, callErr := syscall.SyscallN(
+		LinEXCtrlPowerOut,
+		uintptr(DevHandle[DEVIndex]),
+		uintptr(channel),
+		uintptr(vbat),
+	)
+	if callErr != 0 {
+		return fmt.Errorf("LIN_EX_CtrlPowerOut syscall failed: %w", callErr)
+	}
+	if int(ret) != 0 {
+		return fmt.Errorf("LIN_EX_CtrlPowerOut failed: ret=%d", int(ret))
+	}
+	return nil
+}
+
 func (d *Toomoss) LinMasterSync(msg, outMsg []LinExMsg, channel ToomossCh) (uintptr, error) {
 	if len(outMsg) == 0 || len(msg) == 0 {
 		return 0, fmt.Errorf("LinMasterSync called with empty outMsg")
@@ -754,8 +1001,19 @@ func (d *Toomoss) Close() error {
 	d.closeOnce.Do(func() {
 		d.stateMu.Lock()
 		d.closed = true
+		elinsMode := d.elinsMode
+		channels := d.channels
 		d.stateMu.Unlock()
 		d.callMu.Lock()
+		if elinsMode && ELINS_Stop != 0 {
+			for ch := range channels {
+				_, _, _ = syscall.SyscallN(
+					ELINS_Stop,
+					uintptr(DevHandle[DEVIndex]),
+					uintptr(ch),
+				)
+			}
+		}
 		closeErr = usbClose()
 		d.callMu.Unlock()
 		if closeErr != nil {
@@ -781,7 +1039,59 @@ func (d *Toomoss) LinBreak(channel ToomossCh) error {
 	return nil
 }
 
-const linExSlaveGetDataMaxFrames = 512
+const (
+	linExSlaveGetDataMaxFrames = 512
+	elinsSlaveReadMaxFrames    = 1024
+)
+
+// ElinsSlaveRead reads buffered ELINS frames received in slave mode (ELINS_GetMsg).
+func (d *Toomoss) ElinsSlaveRead(channel ToomossCh) ([]ElinsMsg, error) {
+	if ELINS_GetMsg == 0 {
+		return nil, errors.New("ELINS_GetMsg not loaded")
+	}
+
+	msgs := make([]ElinsMsg, elinsSlaveReadMaxFrames)
+	d.callMu.Lock()
+	if err := d.validateChannel(channel); err != nil {
+		d.callMu.Unlock()
+		return nil, err
+	}
+	d.stateMu.RLock()
+	elinsMode := d.elinsMode
+	d.stateMu.RUnlock()
+	if !elinsMode {
+		d.callMu.Unlock()
+		return nil, errors.New("toomoss: ElinsSlaveRead requires an ELINS slave instance")
+	}
+	ret, _, callErr := syscall.SyscallN(
+		ELINS_GetMsg,
+		uintptr(DevHandle[DEVIndex]),
+		uintptr(channel),
+		uintptr(unsafe.Pointer(&msgs[0])),
+		uintptr(len(msgs)),
+	)
+	d.callMu.Unlock()
+	if callErr != 0 {
+		return nil, fmt.Errorf("ELINS_GetMsg syscall failed: %w", callErr)
+	}
+	if int(ret) < 0 {
+		return nil, fmt.Errorf("ELINS_GetMsg failed: ret=%d", int(ret))
+	}
+
+	count := int(ret)
+	if count > len(msgs) {
+		count = len(msgs)
+	}
+	return msgs[:count], nil
+}
+
+func (d *Toomoss) ElinsSlaveReadFilter(channel ToomossCh, keep ElinsMsgFilter) ([]ElinsMsg, error) {
+	msgs, err := d.ElinsSlaveRead(channel)
+	if err != nil {
+		return nil, err
+	}
+	return FilterElinsMsgs(msgs, keep), nil
+}
 
 func (d *Toomoss) LinExSlaveGetData(channel ToomossCh) ([]LinExMsg, error) {
 	if LinEXSlaveGetData == 0 {
