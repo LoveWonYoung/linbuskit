@@ -1,5 +1,30 @@
 # linbuskit
 
+## Toomoss ELINS
+
+Open one Toomoss instance and add ELINS slave channels to it. Ordinary LIN and
+ELINS can stay initialized together, including on the same physical channel.
+
+```go
+dev, err := driver.NewToomoss([]driver.ToomossCh{driver.CH1}, driver.SlaveMode)
+if err != nil {
+	return err
+}
+defer dev.Close()
+
+err = dev.ConfigureELINS(driver.ELINSConfig{
+	Channels:  []driver.ToomossCh{driver.CH1, driver.CH2},
+	Baudrate:  2_000_000,
+	ResEnable: 1,
+	Version:   driver.ELINS_VER_IND83220,
+})
+if err != nil {
+	return err
+}
+
+messages, err := dev.ElinsSlaveRead(driver.CH1)
+```
+
 `linbuskit` 是一个面向 Go 的 LIN 总线诊断工具库，覆盖了从底层驱动抽象、LIN Transport Protocol（单帧/多帧收发），到面向诊断场景的主站/从站封装，以及一个可直接使用的 UDS over LIN 客户端。
 
 当前仓库更适合作为库集成到上位机、产线工具、诊断脚本或测试程序中，而不是一个开箱即用的 CLI。

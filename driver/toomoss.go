@@ -223,14 +223,15 @@ var (
 )
 
 type Toomoss struct {
-	callMu     sync.Mutex
-	stateMu    sync.RWMutex
-	closeOnce  sync.Once
-	closed     bool
-	elinsMode  bool
-	channels   map[liniface.Channel]struct{}
-	eventMu    sync.Mutex
-	eventChans map[liniface.Channel]chan *liniface.LinEvent
+	callMu        sync.Mutex
+	stateMu       sync.RWMutex
+	closeOnce     sync.Once
+	closeErr      error
+	closed        bool
+	channels      map[liniface.Channel]struct{}
+	elinsChannels map[liniface.Channel]struct{}
+	eventMu       sync.Mutex
+	eventChans    map[liniface.Channel]chan *liniface.LinEvent
 }
 
 var _ liniface.Driver = (*Toomoss)(nil)
@@ -664,80 +665,128 @@ func NewToomoss(channel []ToomossCh, mode byte) (*Toomoss, error) {
 	}
 	toomossInstanceActive = true
 	return &Toomoss{
-		channels:   initializedChannels,
-		eventChans: make(map[liniface.Channel]chan *liniface.LinEvent),
+		channels:      initializedChannels,
+		elinsChannels: make(map[liniface.Channel]struct{}),
+		eventChans:    make(map[liniface.Channel]chan *liniface.LinEvent),
 	}, nil
 }
 
-func ensureElinsReady() error {
-	if err := ensureToomossLoaded(); err != nil {
-		return fmt.Errorf("load Toomoss DLLs: %w", err)
+const defaultELINSReceiveTimeoutUS uint32 = 1000
+
+// ELINSConfig describes ELINS slave channels added to an open Toomoss device.
+// Channels is copied by ConfigureELINS. Baudrate must be 2000–5000000 bps,
+// ResEnable must be 0 or 1, and Version must be one of ELINS_VER_IND83080,
+// ELINS_VER_IND83220, or ELINS_VER_IND83010. A zero ReceiveTimeoutUS uses 1000us.
+type ELINSConfig struct {
+	Channels         []ToomossCh
+	Baudrate         uint32
+	ResEnable        byte
+	Version          byte
+	ReceiveTimeoutUS uint32
+}
+
+func normalizeELINSConfig(config ELINSConfig) (ELINSConfig, error) {
+	config.Channels = append([]ToomossCh(nil), config.Channels...)
+	if len(config.Channels) == 0 {
+		return ELINSConfig{}, errors.New("at least one ELINS channel is required")
+	}
+	if config.Baudrate < 2000 || config.Baudrate > 5000000 {
+		return ELINSConfig{}, fmt.Errorf("ELINS baudrate out of range: %d", config.Baudrate)
+	}
+	if config.ResEnable > 1 {
+		return ELINSConfig{}, fmt.Errorf("ELINS resistor enable must be 0 or 1: %d", config.ResEnable)
+	}
+	if config.Version > ELINS_VER_IND83010 {
+		return ELINSConfig{}, fmt.Errorf("unsupported ELINS version: %d", config.Version)
+	}
+	seen := make(map[ToomossCh]struct{}, len(config.Channels))
+	for _, channel := range config.Channels {
+		if channel < CH1 || channel > CH4 {
+			return ELINSConfig{}, fmt.Errorf("%w: %d", liniface.ErrInvalidChannel, channel)
+		}
+		if _, exists := seen[channel]; exists {
+			return ELINSConfig{}, fmt.Errorf("duplicate ELINS channel: %d", channel)
+		}
+		seen[channel] = struct{}{}
+	}
+	if config.ReceiveTimeoutUS == 0 {
+		config.ReceiveTimeoutUS = defaultELINSReceiveTimeoutUS
+	}
+	return config, nil
+}
+
+// ConfigureELINS initializes additional ELINS slave channels on this open
+// Toomoss instance. LIN and ELINS may use the same physical channel. Calls are
+// serialized with reads and Close. A channel may be configured only once.
+func (d *Toomoss) ConfigureELINS(config ELINSConfig) error {
+	if d == nil {
+		return liniface.ErrDriverClosed
+	}
+	config, err := normalizeELINSConfig(config)
+	if err != nil {
+		return err
+	}
+	d.callMu.Lock()
+	defer d.callMu.Unlock()
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	if d.closed {
+		return liniface.ErrDriverClosed
 	}
 	if ELINS_Init == 0 || ELINS_GetMsg == 0 {
 		return errors.New("ELINS APIs are not available in USB2XXX.dll")
 	}
-	return nil
-}
+	if d.elinsChannels == nil {
+		d.elinsChannels = make(map[liniface.Channel]struct{})
+	}
+	for _, channel := range config.Channels {
+		if _, exists := d.elinsChannels[channel]; exists {
+			return fmt.Errorf("ELINS channel already configured: %d", channel)
+		}
+	}
 
-// NewToomossElins opens the Toomoss adapter and initializes ELINS channels in slave mode.
-// baudrate is in bps (2000–5000000), resEnable 0/1, ver 0=iND83080/081, 1=iND83220, 2=iND83010.
-func NewToomossElins(channel []ToomossCh, baudrate uint32, resEnable byte, ver byte) (*Toomoss, error) {
-	toomossInstanceMu.Lock()
-	defer toomossInstanceMu.Unlock()
-	if toomossInstanceActive {
-		return nil, errors.New("a Toomoss device instance is already active; configure all channels on that instance")
+	initialized := make([]ToomossCh, 0, len(config.Channels))
+	rollback := func() {
+		if ELINS_Stop == 0 {
+			return
+		}
+		for index := len(initialized) - 1; index >= 0; index-- {
+			_, _, _ = syscall.SyscallN(ELINS_Stop, uintptr(DevHandle[DEVIndex]), uintptr(initialized[index]))
+		}
 	}
-	if len(channel) == 0 {
-		return nil, errors.New("at least one ELINS channel is required")
-	}
-	if err := ensureElinsReady(); err != nil {
-		return nil, err
-	}
-	if ok := UsbScan(); !ok {
-		return nil, fmt.Errorf("USB scan failed: device not found or DLL missing")
-	}
-	if ok := UsbOpen(); !ok {
-		return nil, fmt.Errorf("USB open failed")
-	}
-	for _, ch := range channel {
-		ret, _, err := syscall.SyscallN(
+	for _, channel := range config.Channels {
+		ret, _, callErr := syscall.SyscallN(
 			ELINS_Init,
 			uintptr(DevHandle[DEVIndex]),
-			uintptr(ch),
-			uintptr(baudrate),
+			uintptr(channel),
+			uintptr(config.Baudrate),
 			uintptr(SlaveMode),
-			uintptr(resEnable),
-			uintptr(ver),
+			uintptr(config.ResEnable),
+			uintptr(config.Version),
 		)
-		if int(ret) != ELINS_SUCCESS {
-			_ = usbClose()
-			return nil, fmt.Errorf("failed to initialize Toomoss ELINS device: ret=%d, err=%v", int(ret), err)
+		if callErr != 0 || int(ret) != ELINS_SUCCESS {
+			rollback()
+			return fmt.Errorf("ELINS_Init channel %d failed: ret=%d, err=%v", channel, int(ret), callErr)
 		}
+		initialized = append(initialized, channel)
 		if ELINS_SetRevTime != 0 {
-			revRet, _, revErr := syscall.SyscallN(
+			ret, _, callErr = syscall.SyscallN(
 				ELINS_SetRevTime,
 				uintptr(DevHandle[DEVIndex]),
-				uintptr(ch),
-				uintptr(1000),
+				uintptr(channel),
+				uintptr(config.ReceiveTimeoutUS),
 			)
-			if int(revRet) != ELINS_SUCCESS {
-				_ = usbClose()
-				return nil, fmt.Errorf("ELINS_SetRevTime failed: ret=%d, err=%v", int(revRet), revErr)
+			if callErr != 0 || int(ret) != ELINS_SUCCESS {
+				rollback()
+				return fmt.Errorf("ELINS_SetRevTime channel %d failed: ret=%d, err=%v", channel, int(ret), callErr)
 			}
 		}
 	}
-	logDriverf(logDeviceToomoss, "elins_initialized channels=%v baudrate=%d res=%d ver=%d mode=slave", channel, baudrate, resEnable, ver)
-
-	initializedChannels := make(map[liniface.Channel]struct{}, len(channel))
-	for _, ch := range channel {
-		initializedChannels[ch] = struct{}{}
+	for _, channel := range initialized {
+		d.elinsChannels[channel] = struct{}{}
 	}
-	toomossInstanceActive = true
-	return &Toomoss{
-		elinsMode:  true,
-		channels:   initializedChannels,
-		eventChans: make(map[liniface.Channel]chan *liniface.LinEvent),
-	}, nil
+	logDriverf(logDeviceToomoss, "elins_initialized channels=%v baudrate=%d res=%d ver=%d mode=slave", config.Channels, config.Baudrate, config.ResEnable, config.Version)
+	return nil
 }
 
 func (d *Toomoss) LinExCtrlPowerOut(channel ToomossCh, vbat byte) error {
@@ -746,7 +795,7 @@ func (d *Toomoss) LinExCtrlPowerOut(channel ToomossCh, vbat byte) error {
 	}
 	d.callMu.Lock()
 	defer d.callMu.Unlock()
-	if err := d.validateChannel(channel); err != nil {
+	if err := d.validateConfiguredChannel(channel); err != nil {
 		return err
 	}
 	ret, _, callErr := syscall.SyscallN(
@@ -997,16 +1046,17 @@ func (d *Toomoss) Close() error {
 	if d == nil {
 		return nil
 	}
-	var closeErr error
 	d.closeOnce.Do(func() {
 		d.stateMu.Lock()
 		d.closed = true
-		elinsMode := d.elinsMode
-		channels := d.channels
+		elinsChannels := make([]liniface.Channel, 0, len(d.elinsChannels))
+		for channel := range d.elinsChannels {
+			elinsChannels = append(elinsChannels, channel)
+		}
 		d.stateMu.Unlock()
 		d.callMu.Lock()
-		if elinsMode && ELINS_Stop != 0 {
-			for ch := range channels {
+		if ELINS_Stop != 0 {
+			for _, ch := range elinsChannels {
 				_, _, _ = syscall.SyscallN(
 					ELINS_Stop,
 					uintptr(DevHandle[DEVIndex]),
@@ -1014,10 +1064,10 @@ func (d *Toomoss) Close() error {
 				)
 			}
 		}
-		closeErr = usbClose()
+		d.closeErr = usbClose()
 		d.callMu.Unlock()
-		if closeErr != nil {
-			logDriverf(logDeviceToomoss, "disconnect status=failed error=%v", closeErr)
+		if d.closeErr != nil {
+			logDriverf(logDeviceToomoss, "disconnect status=failed error=%v", d.closeErr)
 		} else {
 			logDriverf(logDeviceToomoss, "disconnected")
 		}
@@ -1025,7 +1075,7 @@ func (d *Toomoss) Close() error {
 		toomossInstanceActive = false
 		toomossInstanceMu.Unlock()
 	})
-	return closeErr
+	return d.closeErr
 }
 
 func (d *Toomoss) LinBreak(channel ToomossCh) error {
@@ -1046,22 +1096,33 @@ const (
 
 // ElinsSlaveRead reads buffered ELINS frames received in slave mode (ELINS_GetMsg).
 func (d *Toomoss) ElinsSlaveRead(channel ToomossCh) ([]ElinsMsg, error) {
-	if ELINS_GetMsg == 0 {
-		return nil, errors.New("ELINS_GetMsg not loaded")
-	}
-
 	msgs := make([]ElinsMsg, elinsSlaveReadMaxFrames)
-	d.callMu.Lock()
-	if err := d.validateChannel(channel); err != nil {
-		d.callMu.Unlock()
+	count, err := d.ElinsSlaveReadInto(channel, msgs)
+	if err != nil {
 		return nil, err
 	}
-	d.stateMu.RLock()
-	elinsMode := d.elinsMode
-	d.stateMu.RUnlock()
-	if !elinsMode {
+	return msgs[:count], nil
+}
+
+// ElinsSlaveReadInto reads buffered ELINS frames into msgs and returns the
+// number written. The caller owns msgs and may reuse it after the method
+// returns. Calls are serialized with other Toomoss operations and Close.
+func (d *Toomoss) ElinsSlaveReadInto(channel ToomossCh, msgs []ElinsMsg) (int, error) {
+	if d == nil {
+		return 0, liniface.ErrDriverClosed
+	}
+	if len(msgs) == 0 {
+		return 0, errors.New("ElinsSlaveReadInto requires a non-empty buffer")
+	}
+
+	d.callMu.Lock()
+	if err := d.validateELINSChannel(channel); err != nil {
 		d.callMu.Unlock()
-		return nil, errors.New("toomoss: ElinsSlaveRead requires an ELINS slave instance")
+		return 0, err
+	}
+	if ELINS_GetMsg == 0 {
+		d.callMu.Unlock()
+		return 0, errors.New("ELINS_GetMsg not loaded")
 	}
 	ret, _, callErr := syscall.SyscallN(
 		ELINS_GetMsg,
@@ -1070,19 +1131,20 @@ func (d *Toomoss) ElinsSlaveRead(channel ToomossCh) ([]ElinsMsg, error) {
 		uintptr(unsafe.Pointer(&msgs[0])),
 		uintptr(len(msgs)),
 	)
+	runtime.KeepAlive(msgs)
 	d.callMu.Unlock()
 	if callErr != 0 {
-		return nil, fmt.Errorf("ELINS_GetMsg syscall failed: %w", callErr)
+		return 0, fmt.Errorf("ELINS_GetMsg syscall failed: %w", callErr)
 	}
 	if int(ret) < 0 {
-		return nil, fmt.Errorf("ELINS_GetMsg failed: ret=%d", int(ret))
+		return 0, fmt.Errorf("ELINS_GetMsg failed: ret=%d", int(ret))
 	}
 
 	count := int(ret)
 	if count > len(msgs) {
 		count = len(msgs)
 	}
-	return msgs[:count], nil
+	return count, nil
 }
 
 func (d *Toomoss) ElinsSlaveReadFilter(channel ToomossCh, keep ElinsMsgFilter) ([]ElinsMsg, error) {
@@ -1138,4 +1200,37 @@ func (d *Toomoss) validateChannel(channel liniface.Channel) error {
 		return fmt.Errorf("%w: %d", liniface.ErrInvalidChannel, channel)
 	}
 	return nil
+}
+
+func (d *Toomoss) validateELINSChannel(channel liniface.Channel) error {
+	if d == nil {
+		return liniface.ErrDriverClosed
+	}
+	d.stateMu.RLock()
+	defer d.stateMu.RUnlock()
+	if d.closed {
+		return liniface.ErrDriverClosed
+	}
+	if _, ok := d.elinsChannels[channel]; !ok {
+		return fmt.Errorf("%w: ELINS channel %d", liniface.ErrInvalidChannel, channel)
+	}
+	return nil
+}
+
+func (d *Toomoss) validateConfiguredChannel(channel liniface.Channel) error {
+	if d == nil {
+		return liniface.ErrDriverClosed
+	}
+	d.stateMu.RLock()
+	defer d.stateMu.RUnlock()
+	if d.closed {
+		return liniface.ErrDriverClosed
+	}
+	if _, ok := d.channels[channel]; ok {
+		return nil
+	}
+	if _, ok := d.elinsChannels[channel]; ok {
+		return nil
+	}
+	return fmt.Errorf("%w: %d", liniface.ErrInvalidChannel, channel)
 }
